@@ -43,17 +43,54 @@ reach you through /tmp/agentbus/bus.jsonl, one JSON message per line.
 
   \$BUS name $1-<task>          # published as $1-<task>-001
 
-  Send to another agent:
+  Send to the related window of another agent:
 
   \$BUS send $1 codex "text of the message"
+
+  A bare CLI name selects one window with the same task name (ignoring
+  the CLI prefix and final number), using the job to resolve duplicates.
+  If no task matches, a unique same-job window is selected. Idle roster
+  entries are eligible. The send prints the chosen handle or fails with
+  candidates without sending. A full handle selects that window directly,
+  even across jobs:
+
+  \$BUS send $1 codex-data-export-001 "text for that window"
+
+  Resolved mail stays with that session if it is renamed. For an absent
+  exact handle, only the project-check question queues; details stay held
+  until that handle registers and confirms before the check expires.
+  Broadcast explicitly to reach several windows:
+
+  \$BUS broadcast $1 codex "text for all Codex windows"
+  \$BUS broadcast $1 '*' "text for all agents"
+
+  Before sharing content, the bus sends a project_check question to the
+  chosen window and holds the details in state/pending.<id>.json. Feedback
+  shows waiting or queued, the recipient, and the request or message id.
+  On receiving a project check, answer with the id from the question:
+
+  \$BUS confirm $1 <confirmation-id> yes
+  \$BUS confirm $1 <confirmation-id> no
+
+  Confirm yes only if this window is actually working on the indicated
+  project. A yes releases content and lets these sessions exchange further
+  messages and tasks in both directions without asking again while their
+  task names and jobs stay the same. A project or session change requires
+  a new check. A no or no answer never delivers the details; pending checks
+  expire after ten minutes. Exact handles also need confirmation, and a
+  broadcast checks each currently registered recipient separately. Future
+  windows do not receive it automatically. A normal text reply is not
+  confirmation. With MCP use confirm_project(confirmation_id, accept).
+  This check cannot start a turn in a fully idle window. Desktop
+  notifications and terminal bells are off by default.
 
   See who is running and what they're working on:
 
   \$BUS agents
 
-  Check or set your job. Messages only cross between sessions sharing a job,
-  so a window working on something else won't hear you. Defaults to the repo
-  and branch you're in:
+  Check or set your job. It helps select related windows for bare CLI
+  sends; it does not restrict direct handles or broadcasts. Defaults to
+  the repo and branch you're in:
 
   \$BUS job
   \$BUS job sso-login
@@ -74,11 +111,25 @@ claude() {
     fi
 }
 
+# Codex is launched attached to its shared app-server daemon, because a
+# thread the daemon holds is one `codex queue` can start a turn in -- and
+# that is the only way mail reaches a codex window that has gone idle.
+# Without this the window still works and still gets mail on its own
+# hooks; it just cannot be woken.
+#
+# Set AGENTBUS_CODEX_REMOTE=0 to launch plain codex instead. The flag is
+# marked experimental upstream, so this is the switch to reach for if it
+# ever misbehaves.
+AGENTBUS_CODEX_REMOTE="${AGENTBUS_CODEX_REMOTE:-unix://}"
+
 codex() {
-    if [ "$#" -eq 0 ]; then
+    if [ "$#" -ne 0 ]; then
+        command codex "$@"
+    elif [ "$AGENTBUS_CODEX_REMOTE" = "0" ]; then
         command codex "$(_agentbus_brief codex)"
     else
-        command codex "$@"
+        command codex --remote "$AGENTBUS_CODEX_REMOTE" \
+            "$(_agentbus_brief codex)"
     fi
 }
 

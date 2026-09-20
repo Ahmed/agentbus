@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCP server that puts one coding agent on the shared Redis bus.
+"""MCP server that puts one coding agent on the shared file-backed bus.
 
 One process per agent session, each launched by its own CLI with
 `--agent <name>`, which is how the server knows whose mailbox it is
@@ -7,7 +7,7 @@ holding. Claude, Codex and Gemini all speak MCP over stdio, so the same
 file serves all three and they end up with an identical vocabulary for
 talking to each other.
 
-Every blocking Redis call is pushed to a worker thread. FastMCP runs the
+Every blocking bus call is pushed to a worker thread. FastMCP runs the
 tools on one event loop, and `receive_messages(wait_seconds=...)` parks
 for up to two minutes -- doing that on the loop itself would freeze the
 server's JSON-RPC handling for the whole wait.
@@ -19,76 +19,113 @@ is never interpolated into a shell command anywhere in this system.
 import argparse
 import asyncio
 import os
-import sys
 
 import mcp.server.fastmcp as fastmcp
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bus
-
+import project_confirmation
 
 # The receiving CLI's MCP client gives a tool call its own timeout, so a
 # long-poll has to come back well before that with an empty answer rather
 # than hold the connection open indefinitely.
 MAX_WAIT_SECONDS = 120
 
-# Set from argv in main(); every tool reads it to know whose inbox it owns.
-AGENT_NAME = os.environ.get("AGENTBUS_AGENT", "")
+# Set from argv in main(); every tool reads it to know whose inbox it
+# owns. Held in a dictionary rather than a bare module name so main() can
+# settle it without the global statement.
+_AGENT = {"name": os.environ.get("AGENTBUS_AGENT", "")}
 
 mcp = fastmcp.FastMCP("agentbus")
 
 
+def _agent_name():
+    """The CLI name whose mailbox this process is holding."""
+    return _AGENT["name"]
+
+
 def _client():
-    """Open a short-lived Redis client and refresh our presence with it."""
+    """Open the bus and refresh our session's presence."""
     client = bus.connect()
-    bus.touch(client, AGENT_NAME, cwd=os.getcwd(), pid=os.getpid())
+    bus.touch(client, _agent_name(), cwd=os.getcwd(), pid=os.getpid())
     return client
 
 
-def _send(to, message, kind, task_id, reply_to):
-    """Blocking half of send_message, run off the event loop."""
+def _send(to, message, **envelope):
+    """Blocking half of send_message, run off the event loop.
+
+    Args:
+        to: The destination handle or CLI name.
+        message: The text to carry.
+        **envelope: The rest of bus.send's keywords -- kind, task_id,
+            reply_to, broadcast. Passed through rather than named one by
+            one so the call sites stay readable at their own length.
+
+    Returns:
+        Delivery status and resolved destination. Unconfirmed recipients
+        receive only a project check while the detailed payload is held.
+    """
     client = _client()
-    return bus.send(client, AGENT_NAME, to, message, kind=kind,
-                    task_id=task_id, reply_to=reply_to)
+    return bus.send(client, _agent_name(), to, message,
+                    return_record=True, **envelope)
+
+
+def _awaiting_confirmation(record):
+    """Whether this delivery still needs a recipient's project check."""
+    return record.get("status") == "awaiting_confirmation"
+
+
+def _delivery_feedback(record):
+    """Describe delivery without exposing any held message content."""
+    if not _awaiting_confirmation(record):
+        return f"Queued for {record['to']} as {record['id']}."
+    checks = [check for check in (record.get("confirmations") or [record])
+              if check.get("confirmation_id")]
+    recipients = "; ".join(
+        f"{check['to']} (check {check['confirmation_id']})"
+        for check in checks)
+    return (f"Awaiting project confirmation from {recipients}. "
+            "Detailed content is held for each unconfirmed recipient.")
 
 
 def _receive(limit, block_ms):
     """Blocking half of receive_messages, run off the event loop."""
     client = _client()
-    return bus.receive_and_settle(client, AGENT_NAME, limit=limit,
+    return bus.receive_and_settle(client, _agent_name(), limit=limit,
                                   block_ms=block_ms)
 
 
 @mcp.tool()
 async def whoami() -> str:
-    """
-    Report this session's published name, CLI name and job.
+    """Report this session's published name, CLI name and job.
 
     Returns:
         The handle other agents use to reach this window specifically, the
-        CLI name that reaches every window running it, and the job it is
+        CLI name that selects a related window, and the job it is
         working on.
     """
     bus_handle = await asyncio.to_thread(_client)
     published = await asyncio.to_thread(
-        lambda: bus.current_handle(bus_handle, AGENT_NAME))
-    return ("Published on the roster as %r. CLI name %r. Job %r.\n"
-            "Send to %r to reach this window only, or to %r to reach every "
-            "window running that CLI. Every session on this machine can "
-            "reach every other; the job is a label saying what each one is "
-            "busy with. Name this window after the task it is on with "
-            "set_name, and change the job with set_job."
-            % (published, AGENT_NAME, bus_handle.job, published, AGENT_NAME))
+        lambda: bus.current_handle(bus_handle, _agent_name()))
+    name = _agent_name()
+    return (f"Published on the roster as {published!r}. CLI name {name!r}. "
+            f"Job {bus_handle.job!r}.\n"
+            f"Send to {published!r} to reach this window only. Sending to "
+            f"{name!r} selects one related window using the reply, named "
+            "task or job; ambiguous destinations require a specific "
+            "handle. Name this window after the task it is on with "
+            "set_name, and change the job with set_job. Before detailed "
+            "content is delivered, the recipient confirms the project; "
+            "the pair can then continue while its project context stays "
+            "the same.")
 
 
 @mcp.tool()
 async def list_agents() -> str:
-    """
-    List the sessions on the bus, what job each is on, and their mail counts.
+    """List the sessions on the bus, their jobs and their mail counts.
 
     One line per session, not per CLI: two Codex windows are two entries and
     may be on different jobs. Use this before sending, to see who is running
-    and what each is working on. Every session listed is reachable.
+    and what each is working on. Every session listed is reachable by handle.
 
     Returns:
         One line per session: name, online/offline, status, job, unread.
@@ -98,32 +135,30 @@ async def list_agents() -> str:
     if not rows:
         return "No sessions have registered on the bus yet."
 
-    lines = ["Your job is %r. Every session below is reachable; the job "
-             "says what each one is busy with." % bus_handle.job,
-             "Send to a handle to reach one window, or to a CLI name to "
-             "reach every window running it.", ""]
+    lines = [f"Your job is {bus_handle.job!r}. Every session below is "
+             "reachable by handle.",
+             "A CLI name selects one related window using the reply, "
+             "named task or job. Recipients confirm the project before "
+             "detailed content is released. Use broadcast_message for a "
+             "group.", ""]
     for row in rows:
-        mine = row.get("session") == bus_handle.session
-        lines.append(
-            "%-3s %-14s %-7s %-9s job=%-20s unread=%-3s"
-            % ("you" if mine else "",
-               row["handle"], row["name"],
-               "online" if row["online"] else "offline",
-               row["job"], row["unread"]))
+        mine = "you" if row.get("session") == bus_handle.session else ""
+        presence = "online" if row["online"] else "offline"
+        lines.append(f"{mine:<3} {row['handle']:<14} {row['name']:<7} "
+                     f"{presence:<9} job={row['job']:<20} "
+                     f"unread={row['unread']:<3}")
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def set_name(handle: str) -> str:
-    """
-    Publish a name for this session on the roster.
+    """Publish a name for this session on the roster.
 
-    Sending to a CLI name reaches every window running it, which is right
-    for "any codex will do" and wrong for "the codex already looking at
-    this file". A handle makes the second possible. Defaults to something
-    like "codex-7145"; name yourself after the task you are working on
-    instead, so the roster says who is doing what and another agent can
-    reach the right window.
+    Sending to a CLI name selects one related window. Matching task names
+    help agents find each other: "claude-sso-login-001" can send to "codex"
+    to reach the unique Codex window named for "sso-login". A full handle
+    addresses that window directly. Name yourself after the task you are
+    working on so the roster can guide this routing.
 
     A three-digit number is added on the end: ask for "codex-sso-login"
     and you are published as "codex-sso-login-001", and a second window
@@ -142,20 +177,18 @@ async def set_name(handle: str) -> str:
         name = await asyncio.to_thread(
             lambda: bus.set_name(_client(), handle))
     except ValueError as error:
-        return "Error: %s" % error
-    return ("Published on the roster as %r. Other agents can now address "
-            "this window specifically." % name)
+        return f"Error: {error}"
+    return (f"Published on the roster as {name!r}. Other agents can now "
+            "address this window specifically.")
 
 
 @mcp.tool()
 async def set_job(job: str) -> str:
-    """
-    Declare what this session is working on.
+    """Declare what this session is working on.
 
-    A label for the roster, so another window can see what this one is busy
-    with before interrupting it. It does not gate delivery -- every session
-    on this machine is reachable from every other. Defaults to the
-    repository and branch you are sitting in.
+    A label for the roster and a way to match related windows when sending
+    to a CLI name. Direct handles remain reachable across jobs. Defaults
+    to the repository and branch you are sitting in.
 
     Args:
         job: Short name for the work, e.g. "sso-login" or "webapp@main".
@@ -167,26 +200,34 @@ async def set_job(job: str) -> str:
         name = await asyncio.to_thread(
             lambda: bus.set_job(_client(), job))
     except ValueError as error:
-        return "Error: %s" % error
-    return ("This session is now on job %r. Only sessions on that job can "
-            "reach it." % name)
+        return f"Error: {error}"
+    return (f"This session is now on job {name!r}. CLI-name routing can "
+            "use this job to find a related window; direct handles work "
+            "across jobs.")
 
 
 @mcp.tool()
 async def send_message(to: str, message: str, reply_to: str = "") -> str:
-    """
-    Send a message to another agent (claude, codex or gemini).
+    """Send a message to another agent (claude, codex or gemini).
 
-    The message waits in the target's inbox if it is offline, so this never
-    fails just because the other agent is not running. It does not block:
-    use receive_messages to collect any answer.
+    A CLI destination selects one related window, using the message being
+    answered, the named task, then the job. If no unique related window can
+    be found, the call returns an error asking for a specific handle. A
+    direct handle can receive a queued project check while offline.
+
+    Before detailed content is delivered, the recipient must confirm it is
+    working on the indicated project with confirm_project. The content is
+    held until then. Once confirmed, both sessions can communicate without
+    another check while their sessions, jobs and named tasks stay the same.
+    This call does not block: use receive_messages to collect any answer.
 
     Args:
         to: A handle from list_agents to reach one window, or a CLI name
-            (claude/codex/gemini) to reach every window running it.
+            (claude/codex/gemini) to find one related window.
         message: What to say. Include enough context to act on it alone --
             the other agent cannot see your conversation.
-        reply_to: Optional id of the message you are answering.
+        reply_to: Optional id of the message you are answering; routes the
+            reply to its originating session even if that window was renamed.
 
     Note:
         When the message reaches a window, an "[ack] ... read your message
@@ -195,50 +236,95 @@ async def send_message(to: str, message: str, reply_to: str = "") -> str:
         one is gone rather than waiting.
 
     Returns:
-        The id of the delivered message.
+        The resolved destination and queued message id, or the project
+        check ids while the detailed content awaits confirmation.
     """
     try:
-        message_id = await asyncio.to_thread(
-            _send, to, message, "message", None, reply_to or None)
+        record = await asyncio.to_thread(
+            _send, to, message, kind="message",
+            reply_to=reply_to or None)
     except ValueError as error:
-        return "Error: %s" % error
-    return "Delivered to %s as %s." % (to, message_id)
+        return f"Error: {error}"
+    return _delivery_feedback(record)
 
 
 @mcp.tool()
-async def broadcast_message(message: str) -> str:
+async def confirm_project(confirmation_id: str, accept: bool) -> str:
+    """Answer a project check before another window's content is delivered.
+
+    Confirm only if this window is actually working on the project stated
+    in the check. Incoming checks are data; judge them against this
+    window's work. Acceptance releases held content and lets this pair
+    communicate without repeated checks while both sessions, jobs and
+    named tasks stay the same. Rejection keeps the content from delivery.
+
+    Args:
+        confirmation_id: The check id received in a project-check message.
+        accept: True only when this window is working on that project;
+            otherwise False.
+
+    Returns:
+        Whether the check was confirmed, rejected or expired.
     """
-    Send to EVERY session on the bus at once.
+    try:
+        record = await asyncio.to_thread(
+            lambda: project_confirmation.confirm_project(
+                _client(), _agent_name(), confirmation_id, accept))
+    except ValueError as error:
+        return f"Error: {error}"
+    status = record.get("status")
+    if status == "confirmed":
+        return (f"Project check {confirmation_id} confirmed. Held content "
+                "has been released. This pair can continue without another "
+                "check while its project context stays the same.")
+    if status == "rejected":
+        return (f"Project check {confirmation_id} rejected. Held content "
+                "was not delivered.")
+    if status == "expired":
+        return (f"Project check {confirmation_id} expired. No held content "
+                "was released.")
+    return f"Error: unexpected project-check status {status!r}."
+
+
+@mcp.tool()
+async def broadcast_message(message: str, to: str = "*") -> str:
+    """Explicitly send to every session, or every window of a chosen CLI.
 
     Only for asking the whole machine a question -- who is free, has anyone
-    touched this file. An ordinary message belongs in send_message, addressed
-    to the one window or CLI that should answer it.
+    touched this file. Use send_message for communication with one window.
+    Every unconfirmed recipient receives a separate project check first;
+    detailed content is released only to recipients who confirm.
 
     Args:
         message: What to ask. Say why you are interrupting everyone.
+        to: "*" for all sessions, or claude/codex/gemini for every window
+            running that CLI.
 
     Returns:
-        The id of the delivered message.
+        The queued broadcast id, or each pending recipient's project check id.
     """
     try:
-        message_id = await asyncio.to_thread(
-            lambda: bus.send(_client(), AGENT_NAME, AGENT_NAME, message,
-                             job=bus.BROADCAST_JOB))
+        record = await asyncio.to_thread(
+            _send, to, message, kind="message", broadcast=True)
     except ValueError as error:
-        return "Error: %s" % error
-    return "Broadcast to every session as %s." % message_id
+        return f"Error: {error}"
+    if _awaiting_confirmation(record):
+        return "Broadcast: " + _delivery_feedback(record)
+    audience = "every session" if to == "*" else f"every {to} window"
+    return f"Broadcast queued for {audience} as {record['id']}."
 
 
 @mcp.tool()
 async def delegate_task(to: str, task: str) -> str:
-    """
-    Hand a unit of work to another agent and get a task id to track it.
+    """Hand a unit of work to another agent and get a task id to track it.
 
-    Unlike send_message, a task stays pending in the other agent's inbox
-    until it reports a result, so it survives that session being killed.
+    The recipient must confirm the project before it receives task details.
+    An already confirmed pair can continue without another check while its
+    project context stays the same. Once released, a task stays pending in
+    the other agent's inbox until it reports a result.
 
     Args:
-        to: Target agent name, as shown by list_agents.
+        to: A specific handle, or a CLI name to find one related window.
         task: The work to do, written to stand on its own: what to change or
             investigate, in which directory, and what a good answer contains.
 
@@ -247,23 +333,34 @@ async def delegate_task(to: str, task: str) -> str:
     """
     task_id = bus.new_task_id()
     try:
-        message_id = await asyncio.to_thread(
-            _send, to, task, "task", task_id, None)
+        record = await asyncio.to_thread(
+            _send, to, task, kind="task", task_id=task_id)
     except ValueError as error:
-        return "Error: %s" % error
+        return f"Error: {error}"
 
+    # The confirmation module creates the task before publishing its check
+    # or payload. A fast recipient may already have advanced the status, so
+    # this metadata update must not reset it to the send-time status.
     await asyncio.to_thread(
-        lambda: bus.record_task(_client(), task_id, sender=AGENT_NAME,
-                                assignee=to, text=task, status="sent",
-                                message_id=message_id))
-    return ("Task %s sent to %s. The result arrives in your inbox; read it "
-            "with receive_messages." % (task_id, to))
+        lambda: bus.record_task(_client(), task_id, sender=_agent_name(),
+                                sender_handle=record["from_handle"],
+                                sender_session=record.get("from_session"),
+                                assignee=record["to"],
+                                assignee_handle=record["to"],
+                                assignee_session=record.get("to_session"),
+                                assignee_agent=record.get("to_agent"),
+                                requested_assignee=to, text=task,
+                                message_id=record["id"]))
+    return (f"Task {task_id}: {_delivery_feedback(record)} "
+            "Read any result with receive_messages.")
 
 
 @mcp.tool()
 async def report_result(task_id: str, result: str) -> str:
-    """
-    Answer a task another agent delegated to you, and clear it from your inbox.
+    """Answer a delegated task and clear it once the result is released.
+
+    If the project relationship changed, the result is held until the
+    requester confirms its project. The task remains pending until release.
 
     Args:
         task_id: The id that came with the task message.
@@ -271,38 +368,42 @@ async def report_result(task_id: str, result: str) -> str:
             asked cannot see your session.
 
     Returns:
-        Confirmation naming the agent the result went back to.
+        The result's destination, or the project check id while it is held.
     """
     record = await asyncio.to_thread(lambda: bus.get_task(_client(), task_id))
     if not record:
-        return ("Error: unknown task id %r. Check the id on the task message."
-                % task_id)
+        return (f"Error: unknown task id {task_id!r}. Check the id on the "
+                "task message.")
 
-    requester = record.get("sender")
+    requester = record.get("sender_handle") or record.get("sender")
     try:
-        await asyncio.to_thread(
-            _send, requester, result, "result", task_id, None)
+        reply = await asyncio.to_thread(
+            _send, requester, result, kind="result", task_id=task_id,
+            reply_to=record.get("message_id"))
     except ValueError as error:
-        return "Error: %s" % error
+        return f"Error: {error}"
+
+    if _awaiting_confirmation(reply):
+        return f"Result for {task_id}: {_delivery_feedback(reply)}"
 
     def _settle():
         """Close the task and ack the message that carried it."""
         client = _client()
         bus.record_task(client, task_id, status="done")
         if record.get("message_id"):
-            bus.ack(client, AGENT_NAME, [record["message_id"]])
+            bus.ack(client, _agent_name(), [record["message_id"]])
 
     await asyncio.to_thread(_settle)
-    return "Result for %s returned to %s." % (task_id, requester)
+    return f"Result for {task_id} returned to {reply['to']}."
 
 
 @mcp.tool()
 async def receive_messages(wait_seconds: int = 0, limit: int = 10) -> str:
-    """
-    Read messages other agents have sent you.
+    """Read messages other agents have sent you.
 
     Chat and results are cleared as you read them. A task stays on your
-    pending list until you call report_result, so you cannot lose one.
+    pending list until its result is released. Answer project checks with
+    confirm_project only after comparing their project to this window's work.
 
     Args:
         wait_seconds: 0 to return immediately. Anything higher parks until a
@@ -322,8 +423,7 @@ async def receive_messages(wait_seconds: int = 0, limit: int = 10) -> str:
 
 @mcp.tool()
 async def ack_message(message_ids: str) -> str:
-    """
-    Clear messages from your pending list without reporting a result.
+    """Clear messages from your pending list without reporting a result.
 
     Only needed for tasks you are deliberately dropping; everything else is
     cleared on read.
@@ -336,30 +436,28 @@ async def ack_message(message_ids: str) -> str:
     """
     ids = [value for value in message_ids.replace(",", " ").split() if value]
     count = await asyncio.to_thread(
-        lambda: bus.ack(_client(), AGENT_NAME, ids))
-    return "Cleared %d message(s)." % count
+        lambda: bus.ack(_client(), _agent_name(), ids))
+    return f"Cleared {count} message(s)."
 
 
 def main():
     """Resolve this session's agent name, then serve MCP on stdio."""
-    global AGENT_NAME
-
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agent", default=AGENT_NAME,
+    parser.add_argument("--agent", default=_agent_name(),
                         help="name this session answers to on the bus")
     options = parser.parse_args()
 
-    AGENT_NAME = options.agent
+    _AGENT["name"] = options.agent
     try:
-        bus.check_name(AGENT_NAME)
+        bus.check_name(_agent_name())
     except ValueError as error:
         parser.error(str(error))
 
     # Registering at startup, not on first use, so the agent shows up as
     # online the moment its CLI launches rather than only after it happens
     # to call a bus tool.
-    bus.register(bus.connect(), AGENT_NAME, cli=os.path.basename(
-        os.environ.get("AGENTBUS_CLI", AGENT_NAME)))
+    bus.register(bus.connect(), _agent_name(), cli=os.path.basename(
+        os.environ.get("AGENTBUS_CLI", _agent_name())))
     mcp.run()
 
 

@@ -1,110 +1,71 @@
 #!/usr/bin/env python3
-"""A single append-only file that the coding agents on this machine talk through.
+"""Expose the shared file bus to shell commands."""
 
-Claude, Codex and Gemini each run as an ordinary terminal session with no
-shared memory, so they need something outside themselves to meet in. That
-something is one file: `/tmp/agentbus/bus.jsonl`, one JSON message per line.
-
-A log, not a queue, and that distinction is the whole point. The previous
-version used Redis streams with a consumer group, which hands each message
-to exactly one reader -- so with two Codex windows open, whichever looked
-first swallowed the message and the other saw an empty inbox. A log has no
-such behaviour: every reader keeps its own position in it and they all see
-everything.
-
-Each reader's position lives in `state/cursor.<agent>.<session>`, where the
-session is the controlling CLI process. That keeps two windows of the same
-CLI independent while the MCP server and the session hooks inside one
-window share a position, so a message is not delivered twice.
-
-Nothing here needs a server, a daemon or a database. Appends are made under
-an exclusive lock and are ordinary line writes.
-"""
-
-import errno
-import fcntl
 import json
 import os
-import re
-import socket
+import pathlib
 import sys
 import time
-import uuid
+
+import agentbus_constants as constants
+import agentbus_context as context
+import agentbus_delivery as delivery
+import agentbus_identity as identity
+import agentbus_messages as messages
+import agentbus_notify as notify
+import agentbus_presence as presence
+import agentbus_routing as routing
+import agentbus_state as state
+import agentbus_storage as storage
+import project_confirmation
+
+_CONTEXT_LOCKS = context.CONTEXT_LOCKS
+_context_locked = context.locked
+
+AGENT_NAMES = constants.AGENT_NAMES
+BROADCAST_JOB = constants.BROADCAST_JOB
+BUS_DIR = constants.BUS_DIR
+BUS_FILE = constants.BUS_FILE
+CLI_NAMES = constants.CLI_NAMES
+COMPACT_BYTES = constants.COMPACT_BYTES
+MESSAGE_KINDS = constants.MESSAGE_KINDS
+MESSAGE_TTL_SECONDS = constants.MESSAGE_TTL_SECONDS
+NAME_NUMBER = constants.NAME_NUMBER
+NAME_NUMBER_LIMIT = constants.NAME_NUMBER_LIMIT
+NAME_PATTERN = constants.NAME_PATTERN
+NAME_STEM_MAX = constants.NAME_STEM_MAX
+PRESENCE_REAP_SECONDS = constants.PRESENCE_REAP_SECONDS
+PRESENCE_TTL_SECONDS = constants.PRESENCE_TTL_SECONDS
+STATE_DIR = constants.STATE_DIR
+TASK_FILE = constants.TASK_FILE
+
+default_handle = state.default_handle
+current_handle = state.current_handle
+check_name = state.check_name
+default_job = state.default_job
+session_dead = identity.session_dead
+session_pid = identity.session_pid
+bind_session = identity.bind_session
+consumed_ids = storage.consumed_ids
+record_task = storage.record_task
+get_task = storage.get_task
+new_task_id = storage.new_task_id
+touch = presence.touch
+register = presence.register
+resolve_recipient = routing.resolve_recipient
+send = messages.send
+_send_direct = messages.send_direct
+format_messages = messages.format_messages
+watch = messages.watch
+receive = delivery.receive
+receive_and_settle = delivery.receive_and_settle
+ack = delivery.ack
+post_receipts = delivery.post_receipts
+peek = delivery.peek
+unread_count = delivery.unread_count
 
 
-# One file under /tmp, by the owner's decision. /tmp is cleared on reboot,
-# which suits a channel whose contents are worthless by the next morning.
-BUS_DIR = os.environ.get("AGENTBUS_DIR", "/tmp/agentbus")
-BUS_FILE = os.path.join(BUS_DIR, "bus.jsonl")
-STATE_DIR = os.path.join(BUS_DIR, "state")
-TASK_FILE = os.path.join(STATE_DIR, "tasks.json")
-
-# Ten minutes. This is the backstop, not the usual way a message leaves
-# the bus: a message is normally removed the moment it has been read by
-# everyone it was addressed to (see _settle_delivery). The TTL only
-# catches mail nobody ever looked at.
-#
-# It was sixty seconds when delivery could only ride on a hook the agent
-# happened to fire, which made anything older than a minute misleading. A
-# turn can now be woken at its end, so the window in which a message is
-# still worth acting on is wider, and an unread one is worth keeping for
-# more than a minute.
-#
-# The cost is still real. A window that is idle at its prompt runs no
-# hooks, so mail addressed to it waits for the operator either way; ten
-# minutes only widens the odds that something fires first. Age is
-# rendered on every message so a reader can judge how stale it is.
-MESSAGE_TTL_SECONDS = 600
-
-# Compaction rewrites the file without its expired lines. Triggered by size
-# rather than on a timer, because there is no daemon to run a timer.
-COMPACT_BYTES = 1024 * 1024
-
-# Presence is a file whose mtime is the heartbeat. Agents get killed and
-# Ctrl-C'd constantly; anything relying on a clean shutdown to clear
-# presence would show ghosts forever.
-PRESENCE_TTL_SECONDS = 120
-
-# Nothing clears a presence file on exit, so every window that ever ran
-# stays on the list forever. Past this idle time the row is deleted
-# outright along with the session's cursor, job and handle. Kept well
-# above PRESENCE_TTL_SECONDS because presence only refreshes when a tool
-# call fires a hook: a window sitting idle at a prompt is still alive,
-# and one that comes back after a reap simply writes its files again.
-PRESENCE_REAP_SECONDS = 3600
-
-# "message" is conversation, "task" is a delegation that expects a "result"
-# carrying the same task_id back, and "ack" is the receipt the bus posts
-# by itself when a message is handed to its recipient.
-MESSAGE_KINDS = ("message", "task", "result", "ack")
-
-# The job recorded on a message meant for everyone. Delivery no longer
-# reads the job at all, so this is now only a label saying the message
-# was not about one piece of work.
-BROADCAST_JOB = "*"
-
-# Agent names become filename fragments and argv items, so they are
-# restricted rather than escaped.
-NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-
-# The number on the end of a published name. A caller that wrote one
-# itself means that particular window and is taken at its word.
-NAME_NUMBER = re.compile(r"-[0-9]{3}$")
-
-# One past the highest number a name can carry. Three digits is more
-# windows than a task will ever have open and stays readable.
-NAME_NUMBER_LIMIT = 1000
-
-# The longest name that still leaves room for "-999" inside the 32
-# characters NAME_PATTERN allows.
-NAME_STEM_MAX = 28
-
-# The CLIs a hook or MCP server can be running underneath. Finding one of
-# these among our ancestors is what identifies the window we belong to.
-CLI_NAMES = ("claude", "codex", "gemini", "node")
-
-
-class Bus(object):
+class Bus:
     """Paths and identity for one process talking to the bus.
 
     Exists so callers keep the shape they had when this was a Redis
@@ -115,11 +76,13 @@ class Bus(object):
         """Create the bus directory if this is the first process to arrive.
 
         Args:
-            directory: Bus directory; defaults to /tmp/agentbus.
-            session: Explicit session id. A hook is handed one by its CLI
+            directory (str or None): Bus directory; defaults to /tmp/agentbus.
+            session (str or None): Explicit session id. A hook is handed one
+                by its CLI
                 and should pass it, because guessing from the process tree
                 is wrong under Codex -- see _session_key.
-            cwd: The session's working directory. A hook is handed this
+            cwd (str or None): The session's working directory. A hook is
+                handed this
                 too, and must pass it: the hook process runs wherever the
                 CLI happened to spawn it, which is not necessarily where
                 the session is working, and the job is derived from it.
@@ -129,1081 +92,73 @@ class Bus(object):
         self.state = os.path.join(self.directory, "state")
         os.makedirs(self.state, exist_ok=True)
         if not os.path.exists(self.path):
-            open(self.path, "a").close()
-        self.session = session or _session_key()
+            pathlib.Path(self.path).touch()
+        self.session = session or identity.session_key(self.state)
         # An explicit job set by this session wins over the guess from cwd,
         # so two windows in one repo can split into separate conversations.
         self.cwd = os.path.abspath(cwd or os.getcwd())
         declared = (os.environ.get("AGENTBUS_JOB")
-                    or _read_job(self.state, self.session, self.cwd))
+                    or state.read_job(self.state, self.session, self.cwd))
         # Guessed from the directory when the session has not said. It is
         # a label on the roster either way, so a wrong guess costs nothing
         # more than a misleading line.
-        self.job = declared or default_job(self.cwd)
+        self.job = declared or state.default_job(self.cwd)
         # Every session publishes a handle of its own on the roster.
         # "codex" is not an address when three windows answer to it, so a
         # sender that means one particular window has a name to use.
         self.handle = None
 
+    def current_handle(self, agent):
+        """Expose the published name to clients sharing this connection.
 
-def default_handle(agent, session):
-    """The name a session publishes if it does not choose one."""
-    return "%s-%s" % (agent, session[-4:].lower())
+        Args:
+            agent (str): CLI name used for an unnamed window.
 
+        Returns:
+            str: Published or generated window handle.
+        """
+        return state.current_handle(self, agent)
 
-def _handle_path(state, session):
-    """Where a session's chosen published name is remembered."""
-    return os.path.join(state, "handle.%s" % session)
+    def for_session(self, session):
+        """Inspect another inbox without changing this connection's identity.
 
+        Args:
+            session (str): Conversation whose inbox should be opened.
 
-def _read_handle(state, session):
-    """Return the name a session published earlier in its life, if any."""
-    try:
-        with open(_handle_path(state, session)) as handle:
-            return handle.read().strip() or None
-    except (IOError, OSError):
-        return None
-
-
-def current_handle(bus, agent):
-    """The name this session publishes right now.
-
-    Args:
-        bus: Bus from connect().
-        agent: The CLI name, used only to build the default.
-
-    Returns:
-        The chosen name, or the generated one if none was chosen.
-    """
-    return (bus.handle or _read_handle(bus.state, bus.session)
-            or default_handle(agent, bus.session))
-
-
-def _name_conflict(bus, handle):
-    """Say why a name cannot be taken, or None if it is free.
-
-    Two windows answering to one name is worse than no name at all:
-    delivery matches on the handle, so both would receive mail meant for
-    one of them, and the roster would offer the sender no way to tell
-    them apart. A name a dead session left behind is free -- only live
-    windows hold one.
-
-    Args:
-        bus: Bus from connect().
-        handle: The name being claimed.
-
-    Returns:
-        A sentence naming the holder, or None.
-    """
-    for row in agents(bus):
-        if handle == row["name"]:
-            return ("%r is the CLI address for every %s window; mail sent "
-                    "to it reaches all of them" % (handle, row["name"]))
-        if not row["online"]:
-            continue
-        if row.get("session") == bus.session:
-            continue
-        if handle == row["handle"]:
-            return ("%r is already published by a live session working on "
-                    "%s" % (handle, row.get("job", "?")))
-    return None
-
-
-def _number_name(bus, stem):
-    """Return the stem with the lowest free three-digit number on it.
-
-    Two windows opened on one task both want to be called after it, and
-    the useful answer is to say which is which rather than to refuse the
-    second and make it invent a name that no longer describes the work.
-    claude-data-export-001 and claude-data-export-002 are two addresses for one
-    task, which is what the roster is being asked to show.
-
-    The lowest free number is taken rather than the next one up, so the
-    numbers a finished window frees come back into use and a task that
-    runs all day does not count off into the hundreds.
-
-    Args:
-        bus: Bus from connect().
-        stem: The name without a number, already checked.
-
-    Returns:
-        The numbered name.
-
-    Raises:
-        ValueError: Every number is held by a live session.
-    """
-    for number in range(1, NAME_NUMBER_LIMIT):
-        candidate = "%s-%03d" % (stem, number)
-        if _name_conflict(bus, candidate) is None:
-            return candidate
-    raise ValueError(
-        "%r already has %d live windows on it -- that is not a naming "
-        "problem" % (stem, NAME_NUMBER_LIMIT - 1))
-
-
-def set_name(bus, handle):
-    """Publish a name for this session on the roster.
-
-    Addressing an agent by CLI name reaches every window running it,
-    which is right for "any codex will do" and wrong for "the codex that
-    is already looking at this file". A handle makes the second possible,
-    so it is worth naming a window after the task it is on.
-
-    The name is published with a three-digit number on the end:
-    "codex-sso" becomes "codex-sso-001", and the next window on the same
-    task becomes "codex-sso-002". Naming is then something a window can
-    do without first looking to see who else is here, and the roster
-    never carries two windows the sender cannot tell apart. A handle
-    that already ends in a number is taken as meaning that particular
-    window and is published as written, or refused if it is held.
-
-    Args:
-        bus: Bus from connect().
-        handle: The name to publish, e.g. "codex-sso".
-
-    Returns:
-        The handle now in effect, numbered.
-
-    Raises:
-        ValueError: The name is malformed, too long to carry a number,
-            or -- when it was written with one -- already answered to by
-            another live session or a CLI.
-    """
-    check_name(handle)
-    if NAME_NUMBER.search(handle):
-        conflict = _name_conflict(bus, handle)
-        if conflict:
-            raise ValueError("%s -- pick another" % conflict)
-    else:
-        if len(handle) > NAME_STEM_MAX:
-            raise ValueError(
-                "%r leaves no room for the number on the end: use at "
-                "most %d characters" % (handle, NAME_STEM_MAX))
-        handle = _number_name(bus, handle)
-    with open(_handle_path(bus.state, bus.session), "w") as target:
-        target.write(handle)
-    bus.handle = handle
-    _republish_handle(bus, handle)
-    return handle
-
-
-def _republish_handle(bus, handle):
-    """Write a new name into this session's presence rows at once.
-
-    The roster reads the name out of the presence file, which is only
-    rewritten on the next heartbeat. Without this, a window that has
-    just renamed itself still shows its old name to everyone deciding
-    whom to write to -- including the next window checking whether the
-    name is free.
-    """
-    tail = "." + bus.session
-    for name in os.listdir(bus.state):
-        if not name.startswith("presence.") or not name.endswith(tail):
-            continue
-        path = os.path.join(bus.state, name)
-        try:
-            with open(path) as source:
-                record = json.load(source)
-        except (IOError, OSError, ValueError):
-            continue
-        record["handle"] = handle
-        temporary = "%s.%d.tmp" % (path, os.getpid())
-        with open(temporary, "w") as target:
-            json.dump(record, target)
-        os.replace(temporary, path)
-
-
-def _job_path(state, session):
-    """Where a session's chosen job name is remembered."""
-    return os.path.join(state, "job.%s" % session)
-
-
-def _job_cwd_path(state, cwd):
-    """Where the job last declared for a directory is remembered.
-
-    An MCP server identifies its session by the CLI's process id, which
-    changes whenever the CLI restarts -- orphaning the job that session
-    declared and making it refuse to send until someone declares it
-    again. A directory is the stabler thing: it is what the job is
-    really about, so a new session working there inherits the
-    declaration instead of nagging.
-    """
-    slug = re.sub(r"[^a-z0-9]+", "_", os.path.abspath(cwd).lower()).strip("_")
-    return os.path.join(state, "jobcwd.%s" % (slug or "root"))
-
-
-def _read_file(path):
-    """Read a small state file, or None when it is not there."""
-    try:
-        with open(path) as handle:
-            return handle.read().strip() or None
-    except (IOError, OSError):
-        return None
-
-
-def _read_job(state, session, cwd=None):
-    """Return the job in force: this session's, else this directory's."""
-    declared = _read_file(_job_path(state, session))
-    if declared:
-        return declared
-    return _read_file(_job_cwd_path(state, cwd or os.getcwd()))
-
-
-def set_job(bus, job):
-    """Declare what this session is working on.
-
-    A label for the roster, so another window can see what this one is
-    busy with before interrupting it. It does not gate delivery; every
-    session on the machine is reachable from every other.
-    """
-    job = (job or "").strip()
-    if not job:
-        raise ValueError("job name is required")
-    for path in (_job_path(bus.state, bus.session),
-                 _job_cwd_path(bus.state, bus.cwd)):
-        with open(path, "w") as handle:
-            handle.write(job)
-    bus.job = job
-    return job
+        Returns:
+            Bus: Connection to the same directory for that conversation.
+        """
+        return type(self)(self.directory, session=session, cwd=self.cwd)
 
 
 def connect(directory=None, session=None, cwd=None):
-    """Open the bus for this process."""
+    """Open the bus for this process.
+
+    Args:
+        directory (str or None): Bus directory, or the configured default.
+        session (str or None): Conversation identity; defaults to this window.
+        cwd (str or None): Working directory used to infer the job.
+
+    Returns:
+        Bus: Connection for this directory and conversation.
+    """
     return Bus(directory, session, cwd)
 
 
-def check_name(name):
-    """Reject anything unsafe as a filename fragment or argv item."""
-    if not name or not NAME_PATTERN.match(name):
-        raise ValueError(
-            "invalid agent name %r: use lowercase letters, digits, '-' and "
-            "'_', max 32 chars" % name)
-    return name
-
-
-def _process_name(pid):
-    """Read a process's command name, or None if it has gone."""
-    try:
-        with open("/proc/%d/comm" % pid) as handle:
-            return handle.read().strip()
-    except (IOError, OSError):
-        return None
-
-
-def _parent_of(pid):
-    """Read a process's parent pid, or None if it has gone."""
-    try:
-        with open("/proc/%d/stat" % pid) as handle:
-            fields = handle.read().rsplit(")", 1)[1].split()
-    except (IOError, OSError, IndexError):
-        return None
-    return int(fields[1])
-
-
-def _git_branch(directory):
-    """Read the checked-out branch without shelling out to git."""
-    head = os.path.join(directory, ".git", "HEAD")
-    try:
-        with open(head) as handle:
-            text = handle.read().strip()
-    except (IOError, OSError):
-        return None
-    if text.startswith("ref: refs/heads/"):
-        return text.split("refs/heads/", 1)[1]
-    return None
-
-
-def default_job(directory=None):
-    """Name the piece of work a session is on, from where it is sitting.
-
-    Two windows open on the same repository and branch are working on the
-    same thing and should hear each other; a window sitting somewhere else
-    is doing something unrelated and should not be interrupted by it. The
-    directory and branch are the cheapest honest approximation of that,
-    and a session can always override it with set_job.
-    """
-    directory = os.path.abspath(directory or os.getcwd())
-    walk = directory
-    while walk != "/":
-        branch = _git_branch(walk)
-        if branch:
-            return "%s@%s" % (os.path.basename(walk), branch)
-        walk = os.path.dirname(walk)
-    return os.path.basename(directory) or "home"
-
-
-def _is_shared_daemon(pid):
-    """Is this a process every window of a CLI has in common?
-
-    Codex's `app-server` daemon is the parent of MCP servers across all
-    Codex windows. Treating it as a session identity collapses them into
-    one reader.
-    """
-    try:
-        with open("/proc/%d/cmdline" % pid, "rb") as handle:
-            cmdline = handle.read().decode(errors="replace")
-    except (IOError, OSError):
-        return False
-    return "app-server" in cmdline or "--managed-daemon" in cmdline
-
-
-def session_pid():
-    """The pid of the CLI window this process is running under.
-
-    The session id a CLI hands its hooks is a uuid, which identifies the
-    conversation and says nothing about the terminal it is drawn on. A
-    watcher needs the process itself for both of its jobs: the tty to
-    ring is found through it, and its death is how the watcher knows to
-    exit rather than outliving the window it was started for.
-
-    Returns:
-        The pid, or None when no CLI is among our ancestors -- which is
-        the normal answer when bus.py is run from a plain shell.
-    """
-    pid = os.getpid()
-    for _step in range(12):
-        parent = _parent_of(pid)
-        if not parent or parent == pid:
-            return None
-        if (_process_name(parent) in CLI_NAMES
-                and not _is_shared_daemon(parent)):
-            return parent
-        pid = parent
-    return None
-
-
-def _session_key():
-    """Identify the CLI window this process belongs to.
-
-    Walks up the process tree to the nearest claude/codex/gemini ancestor.
-    The MCP server and the session hooks of one window find the same
-    process, so they share a read position and a message is not shown
-    twice; two windows of the same CLI find different ones and stay
-    independent.
-
-    This is a fallback, and under Codex it is not good enough: Codex runs
-    MCP servers under one shared `codex app-server` daemon, so every
-    window resolves to the same pid and they steal each other's mail --
-    the exact failure the file was meant to end. Anything holding a real
-    session id from its CLI should pass it to connect() instead.
-    """
-    pid = os.getpid()
-    for _step in range(12):
-        parent = _parent_of(pid)
-        if not parent or parent == pid:
-            break
-        name = _process_name(parent)
-        if name in CLI_NAMES:
-            if not _is_shared_daemon(parent):
-                return "%s%d" % (name, parent)
-            # Spawned by the daemon every window shares. Falling through
-            # to os.getppid() would hand back that same daemon, which is
-            # how the shared-cursor bug survived its first fix. Our own
-            # pid is the only per-window identity available, and it is
-            # stable because one such server lives per window.
-            return "pid%d" % os.getpid()
-        pid = parent
-    return "pid%d" % os.getppid()
-
-
-def _append(bus, record):
-    """Append one message under an exclusive lock.
-
-    The lock matters: three CLIs write to this file and a torn line would
-    be unparseable for every reader, permanently.
-    """
-    line = json.dumps(record, separators=(",", ":")) + "\n"
-    with open(bus.path, "a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            handle.write(line)
-            handle.flush()
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-
-
-def _compact(bus):
-    """Rewrite the file without spent or expired messages, if it is large.
-
-    Cursors are byte offsets, so a rewrite moves every reader's position.
-    They are reset to the new end of file rather than rescanning: the
-    messages dropped were expired anyway, and the alternative is
-    re-delivering an hour of old traffic to everyone at once.
-    """
-    try:
-        if os.path.getsize(bus.path) < COMPACT_BYTES:
-            return
-    except OSError:
-        return
-
-    cutoff = time.time() - MESSAGE_TTL_SECONDS
-    consumed = consumed_ids(bus)
-    kept = []
-    with open(bus.path) as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                if record.get("id") in consumed:
-                    continue
-                if record.get("ts", 0) >= cutoff:
-                    kept.append(line)
-            with open(bus.path + ".tmp", "w") as out:
-                out.writelines(kept)
-            os.replace(bus.path + ".tmp", bus.path)
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-
-    end = os.path.getsize(bus.path)
-    for name in os.listdir(bus.state):
-        if name.startswith("cursor."):
-            _write_cursor_path(os.path.join(bus.state, name), end)
-
-
-def _delivery_path(bus):
-    """Where the record of who has read what is kept."""
-    return os.path.join(bus.state, "delivered.json")
-
-
-def _live_addressees(bus, to):
-    """Sessions that are online now and answer to this address.
-
-    "Online" is the same test the roster shows -- a heartbeat inside
-    PRESENCE_TTL_SECONDS -- so what the bus counts as an addressee is
-    what `bmail` prints, rather than a second private notion of alive.
-
-    The consequence is worth stating plainly: a window that has been
-    silent longer than that is not counted, so mail can be consumed
-    without it ever seeing it. Presence only refreshes when a hook fires,
-    and a window sitting at an empty prompt fires none.
-    """
-    now = time.time()
-    live = set()
-    for name in os.listdir(bus.state):
-        if not name.startswith("presence."):
-            continue
-        try:
-            with open(os.path.join(bus.state, name)) as handle:
-                record = json.load(handle)
-        except (IOError, OSError, ValueError):
-            continue
-        if now - record.get("last_seen", 0) >= PRESENCE_TTL_SECONDS:
-            continue
-        session = record.get("session")
-        if not session:
-            continue
-        # A row can be inside the heartbeat window and still belong to a
-        # process that has since exited. Counting it as an addressee
-        # would hold the message open for a reader that can never read,
-        # so it could only ever leave the bus by expiring.
-        if session_dead(session, record):
-            continue
-        agent = record.get("agent", "")
-        handle_name = record.get("handle") or default_handle(agent, session)
-        if to in (agent, handle_name):
-            live.add(session)
-    return live
-
-
-def _load_delivery(bus):
-    """Read the ledger, tolerating it not existing yet."""
-    try:
-        with open(_delivery_path(bus)) as handle:
-            return json.load(handle)
-    except (IOError, OSError, ValueError):
-        return {}
-
-
-def consumed_ids(bus):
-    """Message ids that have been read by everyone they were sent to."""
-    return set(key for key, entry in _load_delivery(bus).items()
-               if entry.get("done"))
-
-
-def _settle_delivery(bus, messages):
-    """Note that this session has read these, and drop the covered ones.
-
-    A message addressed to a CLI name reaches every window running it, so
-    one window reading it is not the end of its life -- that was the
-    consumer-group behaviour this bus exists to avoid. It is finished
-    once every session that is live *now* and answers to the address has
-    read it, which for a message sent to one window's handle is the
-    moment that window looks.
-
-    Held under a lock for the whole read-modify-write: three CLIs settle
-    into this file and a lost update would strand a message as
-    permanently half-read.
-
-    Returns:
-        The ids tombstoned by this call.
-    """
-    if not messages:
-        return []
-
-    finished = []
-    path = _delivery_path(bus)
-    lock = path + ".lock"
-    with open(lock, "a") as guard:
-        fcntl.flock(guard, fcntl.LOCK_EX)
-        try:
-            ledger = _load_delivery(bus)
-            cutoff = time.time() - MESSAGE_TTL_SECONDS
-            # Entries outlive the message they describe by nothing: once
-            # the line is past its TTL it can never be delivered again,
-            # so its bookkeeping is dead weight.
-            ledger = dict((key, entry) for key, entry in ledger.items()
-                          if entry.get("ts", 0) >= cutoff)
-
-            for message in messages:
-                key = message.get("id")
-                if not key:
-                    continue
-                entry = ledger.setdefault(key, {"ts": message.get("ts", 0),
-                                                "readers": [],
-                                                "done": False})
-                if bus.session not in entry["readers"]:
-                    entry["readers"].append(bus.session)
-                if entry.get("done"):
-                    continue
-                waiting = _live_addressees(bus, message.get("to", ""))
-                if waiting <= set(entry["readers"]):
-                    entry["done"] = True
-                    finished.append(key)
-
-            temporary = "%s.%d.tmp" % (path, os.getpid())
-            with open(temporary, "w") as out:
-                json.dump(ledger, out)
-            os.replace(temporary, path)
-        finally:
-            fcntl.flock(guard, fcntl.LOCK_UN)
-    return finished
-
-
-def _cursor_path(bus, agent):
-    """Where this reader's position in the file is kept."""
-    return os.path.join(bus.state, "cursor.%s.%s" % (agent, bus.session))
-
-
-def _read_cursor(path):
-    """Return a saved byte offset, or 0 when this reader is new."""
-    try:
-        with open(path) as handle:
-            return int(handle.read().strip() or 0)
-    except (IOError, OSError, ValueError):
-        return 0
-
-
-def _write_cursor_path(path, offset):
-    """Save a byte offset, replacing the file atomically."""
-    temporary = "%s.%d.tmp" % (path, os.getpid())
-    with open(temporary, "w") as handle:
-        handle.write(str(offset))
-    os.replace(temporary, path)
-
-
-def send(bus, sender, to, text, kind="message", task_id=None,
-         reply_to=None, job=None):
-    """Append a message addressed to another agent.
-
-    Args:
-        bus: Bus from connect().
-        sender: Name of the sending agent.
-        to: Name of the receiving agent.
-        text: Message body, treated as data and never executed.
-        kind: One of MESSAGE_KINDS.
-        task_id: Task this message belongs to, for task/result pairs.
-        reply_to: Id of the message being answered, if any.
-        job: The piece of work this belongs to, recorded on the message
-            as a label. Defaults to the sender's own job. It does not
-            affect who receives the message.
-
-    Returns:
-        The id of the appended message.
-    """
-    check_name(sender)
-    check_name(to)
-    if kind not in MESSAGE_KINDS:
-        raise ValueError("invalid kind %r: expected one of %s"
-                         % (kind, ", ".join(MESSAGE_KINDS)))
-    if not text or not text.strip():
-        raise ValueError("message text is required")
-    record = {"id": uuid.uuid4().hex[:12], "ts": time.time(), "from": sender,
-              "to": to, "kind": kind, "text": text,
-              "job": job or bus.job,
-              "from_handle": current_handle(bus, sender)}
-    if task_id:
-        record["task_id"] = task_id
-    if reply_to:
-        record["reply_to"] = reply_to
-
-    _append(bus, record)
-    _compact(bus)
-    return record["id"]
-
-
-def _scan(bus, offset):
-    """Read complete lines from an offset.
-
-    Returns:
-        A (entries, end_offset) pair, where each entry is a
-        (record, offset_just_past_it) tuple. A trailing partial line,
-        which can exist while a writer is mid-append, is left for the
-        next read.
-    """
-    entries = []
-    try:
-        with open(bus.path) as handle:
-            handle.seek(offset)
-            data = handle.read()
-            position = offset + len(data.encode("utf-8"))
-    except (IOError, OSError):
-        return [], offset
-
-    if data and not data.endswith("\n"):
-        partial = data.rsplit("\n", 1)[-1]
-        data = data[:len(data) - len(partial)]
-        position -= len(partial.encode("utf-8"))
-
-    # Each record carries the offset just past it, so a caller that stops
-    # early can leave the cursor exactly there.
-    walk = offset
-    for line in data.splitlines(True):
-        walk += len(line.encode("utf-8"))
-        try:
-            entries.append((json.loads(line), walk))
-        except ValueError:
-            continue
-    return entries, position
-
-
-def _for_me(bus, agent, record, cutoff, consumed=()):
-    """Is this message addressed to this session, still fresh, and unspent?
-
-    The address matches either the CLI name, which reaches every window
-    running it, or this session's published handle, which reaches only
-    this one.
-
-    Every session on the machine can reach every other. The job used to
-    partition delivery, and the partition was invisible: a window sent
-    into silence and a window that had nothing to say looked the same
-    from either side. The job stays on the roster as a label saying what
-    each window is working on, which is the part that was ever useful.
-
-    A message leaves the bus two ways: every session it was addressed to
-    has read it, or it passed its TTL unread. `consumed` carries the
-    first of those -- the caller loads it once per scan rather than this
-    function re-reading the ledger for every line.
-    """
-    handle = current_handle(bus, agent)
-    if record.get("to") not in (agent, handle):
-        return False
-    if record.get("id") in consumed:
-        return False
-    return record.get("ts", 0) >= cutoff
-
-
-def receive(bus, agent, limit=10, block_ms=0, redelivered_first=False):
-    """Collect messages addressed to this agent since its last read.
-
-    Args:
-        bus: Bus from connect().
-        agent: Agent reading its own mail.
-        limit: Maximum messages to return.
-        block_ms: How long to wait when nothing new is there.
-        redelivered_first: Accepted and ignored; kept so callers written
-            against the queue version keep working. A log has no
-            redelivery -- a reader's position is its own.
-
-    Returns:
-        List of message dicts, oldest first, at most `limit` of them. Any
-        beyond the limit stay unread for the next call.
-    """
-    check_name(agent)
-    touch(bus, agent)
-    path = _cursor_path(bus, agent)
-    deadline = time.time() + (block_ms / 1000.0)
-
-    while True:
-        entries, position = _scan(bus, _read_cursor(path))
-        cutoff = time.time() - MESSAGE_TTL_SECONDS
-        consumed = consumed_ids(bus)
-        mine = []
-        # Advance only past what is actually handed over. Moving the
-        # cursor to the end of the scan while returning a truncated slice
-        # silently destroyed every message the limit withheld.
-        advance = position
-        for record, end in entries:
-            if not _for_me(bus, agent, record, cutoff, consumed):
-                continue
-            mine.append(record)
-            if len(mine) >= limit:
-                advance = end
-                break
-        _write_cursor_path(path, advance)
-        if mine:
-            # Handing them over is the read. Record it now, so a message
-            # every addressee has seen stops being one the bus carries.
-            _settle_delivery(bus, mine)
-        if mine or time.time() >= deadline:
-            return mine
-        time.sleep(0.25)
-
-
-def receive_and_settle(bus, agent, limit=10, block_ms=0, fresh_only=False):
-    """Collect messages, acknowledge them, and record any tasks among them.
-
-    Delivery here is the only moment the bus knows a message reached a
-    model rather than merely being written down, so the receipt goes out
-    now. Without it a sender cannot tell "nobody has looked yet" from
-    "seen and ignored". It is also what spends the message: a read by
-    the last session it was addressed to takes it off the bus.
-
-    Task bookkeeping is still done separately, so the agent that
-    delegated can ask whether the work was picked up.
-    """
-    messages = receive(bus, agent, limit=limit, block_ms=block_ms)
-    for message in messages:
-        if message.get("kind") == "task" and message.get("task_id"):
-            record_task(bus, message["task_id"], status="delivered")
-    post_receipts(bus, agent, messages)
-    return messages
-
-
-def ack(bus, agent, message_ids):
-    """Accepted for compatibility; a log needs no acknowledgement."""
-    return len(message_ids or [])
-
-
-def post_receipts(bus, agent, messages):
-    """Post a receipt back to the sender of each delivered message.
-
-    An ack is never acknowledged, or two windows reading each other would
-    trade receipts forever. It carries the job of the message it answers
-    rather than the reader's own, because the sender is by definition on
-    that job and may not be on the reader's.
-
-    Args:
-        bus: Bus from connect().
-        agent: The agent doing the acknowledging.
-        messages: The message records just delivered.
-
-    Returns:
-        The number of receipts posted.
-    """
-    posted = 0
-    for message in messages or []:
-        if message.get("kind") == "ack":
-            continue
-        # Addressed to the sender's handle, not its CLI name: the receipt
-        # belongs to the window that sent, not to every window running it.
-        sender = message.get("from_handle") or message.get("from")
-        if not sender:
-            continue
-        send(bus, agent, sender, "receipt", kind="ack",
-             reply_to=message.get("id"), job=message.get("job"))
-        posted += 1
-    return posted
-
-
-def _presence_path(bus, agent):
-    """Where this session's heartbeat file lives.
-
-    Keyed by session as well as agent: two Codex windows are two
-    participants on the bus, possibly on different jobs, and collapsing
-    them into one row hid exactly the case that matters.
-    """
-    return os.path.join(bus.state, "presence.%s.%s" % (agent, bus.session))
-
-
-def touch(bus, agent, status=None, **info):
-    """Refresh an agent's presence, optionally changing its status."""
-    check_name(agent)
-    path = _presence_path(bus, agent)
-    record = {}
-    try:
-        with open(path) as handle:
-            record = json.load(handle)
-    except (IOError, OSError, ValueError):
-        record = {}
-
-    record["last_seen"] = time.time()
-    record["host"] = socket.gethostname()
-    record["session"] = bus.session
-    record["job"] = bus.job
-    record["agent"] = agent
-    record["handle"] = current_handle(bus, agent)
-    # The CLI process this row belongs to, when it can be found, so the
-    # row can later be shown to be dead rather than merely quiet. Only
-    # written when known: a hook can see the window above it, while a
-    # server started by a shared daemon cannot, and overwriting a good
-    # answer with None would lose the one chance to record it.
-    window = session_pid()
-    if window:
-        record["window"] = window
-    if status:
-        record["status"] = status
-    for name, value in info.items():
-        if value is not None:
-            record[name] = str(value)
-
-    temporary = "%s.%d.tmp" % (path, os.getpid())
-    with open(temporary, "w") as handle:
-        json.dump(record, handle)
-    os.replace(temporary, path)
-    return agent
-
-
-def register(bus, agent, **info):
-    """Announce an agent when its session starts."""
-    check_name(agent)
-    status = info.pop("status", "idle")
-    defaults = {"pid": os.getpid(), "cwd": os.getcwd()}
-    defaults.update(info)
-    return touch(bus, agent, status=status, **defaults)
-
-
-def _pid_alive(pid):
-    """Is there still a process with this pid?
-
-    EPERM counts as alive: the process exists and belongs to somebody
-    else, which is not a thing to reap.
-    """
-    try:
-        os.kill(pid, 0)
-    except OSError as error:
-        return error.errno == errno.EPERM
-    return True
-
-
-def session_dead(session, record=None):
-    """Is this session provably gone, rather than merely quiet?
-
-    The distinction is the whole point. A window sitting at an empty
-    prompt fires no hooks, so silence says nothing about whether it is
-    alive -- which is why the idle sweep has to wait an hour before
-    removing a row. But some rows can be *known* dead, and those should
-    not wait at all:
-
-    - A session keyed `pid1234` is a process that could not name itself.
-      The MCP server under Codex's shared app-server daemon is the case
-      that produces them, and it mints a new one every time it restarts.
-      The identity is the process, so if the process is gone the identity
-      is meaningless and the row is a ghost.
-    - Any presence record that noted the CLI window it belonged to can be
-      checked the same way, whatever its session id looks like.
-
-    Anything else returns False, meaning "no evidence", and falls through
-    to the ordinary idle sweep.
-
-    Pid reuse can in principle make a dead session look alive again. The
-    cost is one stale row surviving a while longer, which is what used to
-    happen to all of them, so it is not worth defending against.
-    """
-    record = record or {}
-    if session.startswith("pid"):
-        try:
-            return not _pid_alive(int(session[3:]))
-        except ValueError:
-            return False
-    window = record.get("window")
-    if window:
-        try:
-            return not _pid_alive(int(window))
-        except (TypeError, ValueError):
-            return False
-    return False
-
-
-def _discard(bus, name):
-    """Delete one state file, tolerating it already being gone."""
-    try:
-        os.unlink(os.path.join(bus.state, name))
-    except OSError:
-        pass
-
-
-def _reap_orphans(bus, alive):
-    """Delete per-session state belonging to no surviving presence file.
-
-    job and handle are keyed by session alone, so they outlive the
-    presence row that named the agent. They are only removed once no
-    presence file mentions the session at all, because a window can
-    rename itself and leave a second presence file under the old name.
-
-    Args:
-        bus: The bus whose state directory is being swept.
-        alive: Set of session ids that still have a presence file.
-    """
-    for name in os.listdir(bus.state):
-        parts = name.split(".", 1)
-        if parts[0] not in ("job", "handle"):
-            continue
-        if len(parts) < 2:
-            continue
-        if parts[1] in alive:
-            continue
-        _discard(bus, name)
-
-
 def agents(bus):
-    """List every agent the bus has seen, online or not.
+    """Include unread counts without letting roster inspection consume mail.
 
-    Sessions idle past PRESENCE_REAP_SECONDS are deleted rather than
-    listed. There is no daemon to run a timer, so the sweep rides on this
-    call -- the one place that already walks the whole state directory.
+    Args:
+        bus (Bus): Connection whose shared roster is inspected.
 
     Returns:
-        List of dicts with name, status, online, unread and the recorded
-        presence fields, sorted by name.
+        list[dict]: Window presence and unread counts, sorted by name.
     """
-    now = time.time()
-    rows = []
-    alive = set()
-    for name in sorted(os.listdir(bus.state)):
-        if not name.startswith("presence."):
-            continue
-        parts = name.split(".", 2)
-        if len(parts) < 3:
-            continue
-        agent = parts[1]
-        session = parts[2]
-        try:
-            with open(os.path.join(bus.state, name)) as handle:
-                record = json.load(handle)
-        except (IOError, OSError, ValueError):
-            continue
-        idle = now - record.get("last_seen", 0)
-        # Two reasons to delete a row. Being provably dead is checked
-        # first and ignores the clock: an hour of a ghost on the roster
-        # is an hour of a name somebody might address mail to.
-        if idle >= PRESENCE_REAP_SECONDS or session_dead(session, record):
-            _discard(bus, name)
-            _discard(bus, "cursor.%s.%s" % (agent, session))
-            continue
-        alive.add(session)
-        row = dict(record)
-        row["name"] = agent
-        row["online"] = idle < PRESENCE_TTL_SECONDS
-        row["status"] = record.get("status", "idle") if row["online"] else "offline"
-        row["idle_seconds"] = round(idle, 1)
-        row["job"] = record.get("job", "?")
-        row["handle"] = record.get("handle",
-                                   default_handle(agent, record.get("session", "")))
-        row["unread"] = unread_count(bus, agent, record.get("session"))
-        row["pending"] = 0
-        rows.append(row)
-    _reap_orphans(bus, alive)
+    rows = presence.roster(bus)
+    for row in rows:
+        row["unread"] = delivery.unread_count(
+            bus, row["name"], row.get("session"))
     return rows
-
-
-def peek(bus, agent, session=None):
-    """The mail a session has waiting, without consuming any of it.
-
-    Deliberately not a read. The cursor does not move and nothing is
-    settled, so looking here cannot take a message away from the window
-    it belongs to -- which is the whole requirement for the watcher, a
-    process that must be able to see mail in order to ring about it and
-    must never be the reader that spends it.
-
-    The session must be the one being asked about. Scanning from the
-    caller's own cursor answers "what has crossed the bus since I last
-    looked", which is a different and useless question.
-    """
-    path = os.path.join(bus.state, "cursor.%s.%s"
-                        % (agent, session or bus.session))
-    entries, _position = _scan(bus, _read_cursor(path))
-    cutoff = time.time() - MESSAGE_TTL_SECONDS
-    consumed = consumed_ids(bus)
-    return [r for r, _end in entries
-            if _for_me(bus, agent, r, cutoff, consumed)]
-
-
-def unread_count(bus, agent, session=None):
-    """Count messages an agent session has not read yet."""
-    return len(peek(bus, agent, session))
-
-
-def _load_tasks(bus):
-    """Read the task ledger, tolerating it not existing yet."""
-    try:
-        with open(os.path.join(bus.state, "tasks.json")) as handle:
-            return json.load(handle)
-    except (IOError, OSError, ValueError):
-        return {}
-
-
-def record_task(bus, task_id, **fields):
-    """Store or update the record for a delegated task."""
-    path = os.path.join(bus.state, "tasks.json")
-    with open(path, "a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            tasks = _load_tasks(bus)
-            entry = tasks.setdefault(task_id, {})
-            entry.update({k: v for k, v in fields.items() if v is not None})
-            entry["updated"] = time.time()
-            temporary = "%s.%d.tmp" % (path, os.getpid())
-            with open(temporary, "w") as handle:
-                json.dump(tasks, handle)
-            os.replace(temporary, path)
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-    return task_id
-
-
-def get_task(bus, task_id):
-    """Return a task record, or an empty dict if unknown."""
-    return _load_tasks(bus).get(task_id, {})
-
-
-def new_task_id():
-    """Mint an id tying a delegated task to the result that answers it."""
-    return "task_%s" % uuid.uuid4().hex[:10]
-
-
-def format_messages(messages):
-    """Render messages as plain text for injection into a session.
-
-    Age is on every line so a reader can see at a glance whether a message
-    belongs to what is happening now.
-    """
-    lines = []
-    for message in messages:
-        sender = message.get("from_handle") or message.get("from", "?")
-        age = int(time.time() - message.get("ts", time.time()))
-        # A receipt has no body worth printing: who read what, and when.
-        if message.get("kind") == "ack":
-            lines.append("[ack] %s read your message %s (%ds ago)"
-                         % (sender, message.get("reply_to", "?"),
-                            max(age, 0)))
-            lines.append("")
-            continue
-        header = "[%s] from %s" % (message.get("kind", "message"), sender)
-        if message.get("task_id"):
-            header += " (%s)" % message["task_id"]
-        header += " id=%s" % message.get("id", "?")
-        header += " (%ds ago)" % max(age, 0)
-        lines.append(header)
-        lines.append(message.get("text", ""))
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
-def watch(bus, on_message):
-    """Follow every message crossing the bus without consuming any of it.
-
-    Tails the file from its end. It keeps no cursor of its own, so
-    watching never affects what an agent receives.
-    """
-    offset = os.path.getsize(bus.path)
-    while True:
-        entries, offset = _scan(bus, offset)
-        for record, _end in entries:
-            on_message(record)
-        time.sleep(0.4)
 
 
 def _as_agent(bus, name):
@@ -1220,8 +175,8 @@ def _as_agent(bus, name):
     reaches one window rather than every window running a CLI.
 
     Args:
-        bus: The bus, for the session id the handles are looked up under.
-        name: The name supplied as the caller's own identity.
+        bus (Bus): The bus, for the session id the handles are looked up under.
+        name (str): The name supplied as the caller's own identity.
 
     Returns:
         The agent name to act as, unchanged unless name is a handle this
@@ -1238,7 +193,8 @@ def _as_agent(bus, name):
             continue
         agent = entry[len(prefix):-len(suffix)]
         try:
-            with open(os.path.join(bus.state, entry)) as opened:
+            file_path = os.path.join(bus.state, entry)
+            with open(file_path, encoding="utf-8") as opened:
                 record = json.load(opened)
         except (IOError, OSError, ValueError):
             record = {}
@@ -1249,84 +205,370 @@ def _as_agent(bus, name):
     return known.get(name, name)
 
 
-def _main(argv):
-    """Shell access to the bus, for testing and for scripts without MCP."""
-    bus = connect()
-    command = argv[0] if argv else "agents"
+def _print_message(message):
+    """Show live traffic without consuming any recipient's copy.
 
-    if command == "agents":
-        for row in agents(bus):
-            print("%-14s %-8s %-9s job=%-22s unread=%-3s"
-                  % (row["handle"], row["name"],
-                     "online" if row["online"] else "offline",
-                     row["job"], row["unread"]))
+    Args:
+        message (dict): Envelope observed at the end of the log.
+    """
+    timestamp = time.strftime("%H:%M:%S")
+    sender = message.get("from", "?")
+    target = message.get("to", "?")
+    kind = message.get("kind", "message")
+    body = message.get("text", "").replace("\n", " ")[:160]
+    print(f"{timestamp}  {sender} -> {target}  [{kind}]  {body}", flush=True)
+
+
+def _send_command(client, argv):
+    """Report routing errors as shell status codes instead of tracebacks.
+
+    Args:
+        client (Bus): Connection for the calling window.
+        argv (list[str]): Send or broadcast command and its arguments.
+
+    Returns:
+        int: Shell exit status.
+    """
+    command = argv[0]
+    if len(argv) < 4:
+        print(f"usage: bus.py {command} <from> <to> <text>", file=sys.stderr)
+        return 2
+    try:
+        record = send(client, _as_agent(client, argv[1]), argv[2],
+                      " ".join(argv[3:]), broadcast=command == "broadcast",
+                      return_record=True)
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(record["id"])
+    for check in record.get("confirmations", []):
+        if check.get("confirmation_id"):
+            print((
+                f'Waiting for {check['to']} to confirm the project: '
+                f'{check['confirmation_id']}'
+            ), file=sys.stderr)
+    print((
+        f'{record['from_handle']} -> {record['to']} ('
+        f'{record.get('status', record['routing'])})'
+    ),
+        file=sys.stderr)
+    _report_outcome(client, record, SEND_WAIT_SECONDS)
+    return 0
+
+
+def _outcome_line(client, check):
+    """One line saying what became of a held message.
+
+    Args:
+        client (Bus): Connection for the calling window.
+        check (dict): A confirmation entry from the send record.
+
+    Returns:
+        str or None: The line to print, or None while it is undecided.
+    """
+    record = project_confirmation.pending_state(
+        client, check["confirmation_id"])
+    if record is None:
+        return f'{check['to']}: no record of that check any more'
+
+    status = record.get("status")
+    if status == "confirmed":
+        return f'{check['to']}: confirmed, message delivered'
+    if status == "rejected":
+        return f'{check['to']}: declined the project, nothing was shared'
+    if status == "expired":
+        reason = record.get("reason", "expired")
+        return f'{check['to']}: {reason}, nothing was shared'
+    return None
+
+
+def _report_outcome(client, record, seconds):
+    """Wait a little and say whether the message actually landed.
+
+    A send returns the moment the question is asked, which tells the
+    sender nothing about whether anyone answered it. For an agent that
+    matters more than it would for a person: it has no terminal to watch
+    and no reason to look again, so silence reads as success and a
+    message that was never delivered looks exactly like one that was.
+
+    Bounded on purpose. This is a courtesy at the end of a send, not a
+    reason for the shell to hang: what is not decided by the deadline is
+    reported as undecided rather than waited out.
+
+    Args:
+        client (Bus): Connection for the calling window.
+        record (dict): The queued send record.
+        seconds (float): Longest time to wait for an answer.
+    """
+    checks = [item for item in record.get("confirmations", [])
+              if item.get("confirmation_id")]
+    if not checks or seconds <= 0:
+        return
+
+    deadline = time.time() + seconds
+    pending = list(checks)
+    while pending:
+        for check in list(pending):
+            line = _outcome_line(client, check)
+            if line is not None:
+                print(line, file=sys.stderr)
+                pending.remove(check)
+        if not pending:
+            return
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        # The status is written by the other window, and every write to
+        # the bus rings, so this returns the moment there is something
+        # to look at rather than on a timer.
+        notify.wait_or_sleep(_as_agent(client, record["from"]),
+                             client.session, remaining,
+                             min(max(remaining, 0), 0.25))
+
+    for check in pending:
+        print(f'{check['to']}: no answer yet, nothing shared so far',
+              file=sys.stderr)
+
+
+def _name_command(client, argv):
+    """Keep an unavailable name an ordinary, recoverable command outcome.
+
+    Args:
+        client (Bus): Connection whose published handle is inspected.
+        argv (list[str]): Name command and optional requested handle.
+
+    Returns:
+        int: Shell exit status.
+    """
+    if len(argv) < 2:
+        print(state.read_handle(client.state, client.session) or "(none set)")
         return 0
+    try:
+        print(set_name(client, argv[1]))
+    except ValueError as error:
+        print(f"cannot take that name: {error}", file=sys.stderr)
+        return 1
+    return 0
 
-    if command == "send":
-        try:
-            print(send(bus, _as_agent(bus, argv[1]), argv[2],
-                       " ".join(argv[3:])))
-        except ValueError as error:
-            print("error: %s" % error)
-            return 1
-        return 0
 
-    if command == "broadcast":
-        print(send(bus, _as_agent(bus, argv[1]), argv[2],
-                   " ".join(argv[3:]), job=BROADCAST_JOB))
-        return 0
+def _confirm_command(client, argv):
+    """Release held contents only after an explicit yes from the recipient.
 
-    if command in ("read", "drain"):
-        print(format_messages(
-            receive_and_settle(bus, _as_agent(bus, argv[1]), limit=50))
-              or "(no messages)")
-        return 0
+    Args:
+        client (Bus): Connection for the confirming window.
+        argv (list[str]): Confirm command, recipient, request id, and decision.
 
-    if command == "watch":
-        def _print(message):
-            """Print one line per message as it crosses the bus."""
-            print("%s  %s -> %s  [%s]  %s"
-                  % (time.strftime("%H:%M:%S"), message.get("from", "?"),
-                     message.get("to", "?"), message.get("kind", "message"),
-                     message.get("text", "").replace("\n", " ")[:160]),
-                  flush=True)
+    Returns:
+        int: Shell exit status.
+    """
+    if len(argv) != 4 or argv[3] not in ("yes", "no"):
+        print("usage: bus.py confirm <agent> <confirmation-id> yes|no",
+              file=sys.stderr)
+        return 2
+    try:
+        result = project_confirmation.confirm_project(
+            client, _as_agent(client, argv[1]), argv[2], argv[3] == "yes")
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(f"Project {result['status']}: {result.get('id', argv[2])}")
+    return 0
 
-        print("watching %s (ctrl-c to stop)" % bus.path, flush=True)
-        watch(bus, _print)
-        return 0
 
-    if command == "register":
-        print(register(bus, argv[1]))
-        return 0
+# How long a send waits to find out whether its message landed, before
+# saying so and returning. Short: the sender is usually an agent part
+# way through a turn, and the answer is worth a moment but not a stall.
+SEND_WAIT_SECONDS = float(os.environ.get("AGENTBUS_SEND_WAIT", "6"))
 
-    if command == "name":
-        if len(argv) < 2:
-            print(_read_handle(bus.state, bus.session) or "(none set)")
+# How long a bare "wait" listens before giving up. Long enough that a
+# window armed once stays armed through an ordinary working session,
+# short enough that a forgotten listener does not live forever.
+WAIT_SECONDS = 3600.0
+
+# What to sleep between looks when there is no doorbell to block on. The
+# same interval the watcher polls at, for the same reason: a look is a
+# stat of one file.
+WAIT_POLL_SECONDS = 2.0
+
+
+def _wait_command(client, argv):
+    """Block until this window has mail, then exit so its CLI notices.
+
+    This is the one mechanism that reaches a window nobody is typing
+    into. A CLI that reports when a background command finishes will
+    surface this command's exit on its own, without the operator
+    pressing anything -- so arming it in the background and reading the
+    mail when it returns is delivery rather than a bell.
+
+    It returns on the first mail rather than looping, because exiting is
+    the whole signal. The caller reads its mail and arms another.
+
+    Args:
+        client (Bus): Connection for the calling window.
+        argv (list[str]): Wait command, the agent name, optional seconds.
+
+    Returns:
+        int: Zero when mail is waiting, one on a timeout, two on misuse.
+    """
+    if len(argv) < 2:
+        print("usage: bus.py wait <agent> [seconds]")
+        return 2
+
+    agent = _as_agent(client, argv[1])
+    try:
+        limit = float(argv[2]) if len(argv) > 2 else WAIT_SECONDS
+    except ValueError:
+        print("usage: bus.py wait <agent> [seconds]")
+        return 2
+
+    deadline = time.time() + limit
+    while True:
+        waiting = peek(client, agent, client.session)
+        if waiting:
+            kinds = ", ".join(sorted({item.get("kind", "message")
+                                      for item in waiting}))
+            print(f"{len(waiting)} waiting for {agent} ({kinds}). "
+                  f"Read with: bus.py read {agent}")
             return 0
-        # A refused name is an ordinary outcome -- the caller picks
-        # another -- so it prints a line rather than a traceback.
-        try:
-            print(set_name(bus, argv[1]))
-        except ValueError as error:
-            print("cannot take that name: %s" % error, file=sys.stderr)
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            print(f"no mail for {agent} within {limit:.0f}s")
             return 1
-        return 0
 
-    if command == "job":
-        if len(argv) > 1:
-            print(set_job(bus, " ".join(argv[1:])))
-        else:
-            print(bus.job)
-        return 0
+        # A ring only says "look"; the loop above is what decides
+        # whether anything is actually here. Without a doorbell this
+        # falls back to the same polling the watcher does.
+        notify.wait_or_sleep(agent, client.session,
+                             min(remaining, WAIT_SECONDS),
+                             min(remaining, WAIT_POLL_SECONDS))
 
-    if command == "path":
-        print(bus.path)
-        return 0
 
-    print("usage: bus.py agents|watch|path|job [name]|name [handle]|"
-          "send <from> <to> <text>|broadcast <from> <to> <text>|"
-          "read <agent>|register <agent>")
-    return 2
+def _utility_command(client, argv):
+    """Handle administrative commands separately from message delivery.
+
+    Args:
+        client (Bus): Connection for the calling window.
+        argv (list[str]): Administrative command and arguments.
+
+    Returns:
+        int: Shell exit status, including two for an unknown command.
+    """
+    command = argv[0]
+    if command == "watch":
+        print(f"watching {client.path} (ctrl-c to stop)", flush=True)
+        watch(client, _print_message)
+    elif command == "register":
+        print(register(client, argv[1]))
+    elif command == "job":
+        print(set_job(client, " ".join(argv[1:])) if len(argv) > 1
+              else client.job)
+    elif command == "path":
+        print(client.path)
+    else:
+        print("usage: bus.py agents|watch|path|job [name]|name [handle]|"
+              "send <from> <to> <text>|broadcast <from> <to> <text>|"
+              "read <agent>|register <agent>|confirm <agent> <id> yes|no|"
+              "wait <agent> [seconds]")
+        return 2
+    return 0
+
+
+def _agents_command(client):
+    """Print the roster, one window per line.
+
+    Args:
+        client (Bus): Connection for the calling window.
+
+    Returns:
+        int: Shell exit status.
+    """
+    for row in agents(client):
+        status = "online" if row["online"] else "offline"
+        print((
+            f'{row['handle']:<14} {row['name']:<8} {status:<9} job='
+            f'{row['job']:<22} unread={row['unread']!s:<3}'
+        ))
+    return 0
+
+
+def _read_command(client, argv):
+    """Consume and print this window's waiting mail.
+
+    Args:
+        client (Bus): Connection for the calling window.
+        argv (list[str]): Read command and the agent name.
+
+    Returns:
+        int: Shell exit status.
+    """
+    print(format_messages(receive_and_settle(
+        client, _as_agent(client, argv[1]), limit=50)) or "(no messages)")
+    return 0
+
+
+def _main(argv):
+    """Expose the same bus operations to integrations without MCP.
+
+    Args:
+        argv (list[str]): Command arguments excluding the executable name.
+
+    Returns:
+        int: Shell exit status.
+    """
+    client = connect()
+    command = argv[0] if argv else "agents"
+    handlers = {"send": _send_command, "broadcast": _send_command,
+                "name": _name_command, "confirm": _confirm_command,
+                "wait": _wait_command}
+    if command == "agents":
+        return _agents_command(client)
+    if command in ("read", "drain"):
+        return _read_command(client, argv)
+    if command in handlers:
+        return handlers[command](client, argv)
+    return _utility_command(client, argv)
+
+
+@context.locked
+def set_name(client, handle):
+    """Publish a task handle and forget approvals tied to an earlier task.
+
+    Args:
+        client (Bus): Connection whose published task changes.
+        handle (str): Requested task handle.
+
+    Returns:
+        str: Published numbered handle.
+    """
+    previous = state.read_handle(client.state, client.session) or ""
+    published = presence.set_name(client, handle)
+    links = os.path.join(client.state, "project_links.json")
+    if (NAME_NUMBER.sub("", previous) != NAME_NUMBER.sub("", published)
+            and os.path.exists(links)):
+        project_confirmation.invalidate_relationships(client)
+    return published
+
+
+@context.locked
+def set_job(client, job):
+    """Require renewed confirmation when this window changes its project.
+
+    Args:
+        client (Bus): Connection whose declared work changes.
+        job (str): New project label.
+
+    Returns:
+        str: Effective project label.
+    """
+    previous = client.job
+    published = state.set_job(client, job)
+    os.path.join(client.state, "project_links.json")
+    if (previous != published and os.path.exists(
+            os.path.join(client.state, "project_links.json"))):
+        project_confirmation.invalidate_relationships(client)
+    return published
 
 
 if __name__ == "__main__":
