@@ -6,6 +6,7 @@ import socket
 import time
 
 import agentbus_constants as constants
+import agentbus_identity as identity
 import agentbus_state as state
 
 
@@ -170,6 +171,12 @@ def live_addressees(bus, to):
         session = record.get("session")
         if not session:
             continue
+        # A row can be inside the heartbeat window and still belong to a
+        # process that has since exited. Counting it as an addressee
+        # would hold the message open for a reader that can never read,
+        # so it could only ever leave the bus by expiring.
+        if identity.session_dead(session, record):
+            continue
         agent = record.get("agent", "")
         handle_name = record.get(
             "handle") or state.default_handle(agent, session)
@@ -264,6 +271,14 @@ def touch(bus, agent, status=None, **info):
     record["job"] = bus.job
     record["agent"] = agent
     record["handle"] = state.current_handle(bus, agent)
+    # The CLI process this row belongs to, when it can be found, so the
+    # row can later be shown to be dead rather than merely quiet. Only
+    # written when known: a hook can see the window above it, while a
+    # server started by a shared daemon cannot, and overwriting a good
+    # answer with None would lose the one chance to record it.
+    window = identity.session_pid()
+    if window:
+        record["window"] = window
     if status:
         record["status"] = status
     for name, value in info.items():
@@ -350,7 +365,11 @@ def roster(bus):
         except (IOError, OSError, ValueError):
             continue
         idle = now - record.get("last_seen", 0)
-        if idle >= constants.PRESENCE_REAP_SECONDS:
+        # Two reasons to delete a row. Being provably dead is checked
+        # first and ignores the clock: an hour of a ghost on the roster
+        # is an hour of a name somebody might address mail to.
+        if (idle >= constants.PRESENCE_REAP_SECONDS
+                or identity.session_dead(session, record)):
             state.discard(bus, name)
             state.discard(bus, f'cursor.{agent!s}.{session!s}')
             continue

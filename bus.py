@@ -45,6 +45,7 @@ check_name = state.check_name
 default_job = state.default_job
 session_pid = identity.session_pid
 bind_session = identity.bind_session
+session_dead = identity.session_dead
 consumed_ids = storage.consumed_ids
 record_task = storage.record_task
 get_task = storage.get_task
