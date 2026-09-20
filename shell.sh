@@ -38,9 +38,10 @@ reach you through /tmp/agentbus/bus.jsonl, one JSON message per line.
 
   Name this window after the task you are on, so the roster says who is
   doing what and another agent can reach you rather than any $1 window.
-  The name has to be one no live session already holds:
+  A three-digit number is added on the end, so the name is yours even if
+  another window is already on the task -- read back what you were given:
 
-  \$BUS name $1-<task>
+  \$BUS name $1-<task>          # published as $1-<task>-001
 
   Send to another agent:
 

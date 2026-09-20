@@ -125,16 +125,18 @@ async def set_name(handle: str) -> str:
     instead, so the roster says who is doing what and another agent can
     reach the right window.
 
-    The name must be free: one a live session already publishes is
-    refused, as is a bare CLI name. On a refusal, pick another and call
-    again.
+    A three-digit number is added on the end: ask for "codex-sso-login"
+    and you are published as "codex-sso-login-001", and a second window
+    on the same task becomes "codex-sso-login-002". So the name you want
+    is yours whether or not somebody else is already on the task -- ask
+    for the task, and read back the name you were given.
 
     Args:
-        handle: Lowercase name for the task, e.g. "codex-sso-login".
-            Letters, digits, '-', '_'.
+        handle: Lowercase name for the task, e.g. "codex-sso-login",
+            at most 28 characters. Letters, digits, '-', '_'.
 
     Returns:
-        The handle now published.
+        The handle now published, with its number.
     """
     try:
         name = await asyncio.to_thread(

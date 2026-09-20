@@ -87,6 +87,18 @@ BROADCAST_JOB = "*"
 # restricted rather than escaped.
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
+# The number on the end of a published name. A caller that wrote one
+# itself means that particular window and is taken at its word.
+NAME_NUMBER = re.compile(r"-[0-9]{3}$")
+
+# One past the highest number a name can carry. Three digits is more
+# windows than a task will ever have open and stays readable.
+NAME_NUMBER_LIMIT = 1000
+
+# The longest name that still leaves room for "-999" inside the 32
+# characters NAME_PATTERN allows.
+NAME_STEM_MAX = 28
+
 # The CLIs a hook or MCP server can be running underneath. Finding one of
 # these among our ancestors is what identifies the window we belong to.
 CLI_NAMES = ("claude", "codex", "gemini", "node")
@@ -197,6 +209,38 @@ def _name_conflict(bus, handle):
     return None
 
 
+def _number_name(bus, stem):
+    """Return the stem with the lowest free three-digit number on it.
+
+    Two windows opened on one task both want to be called after it, and
+    the useful answer is to say which is which rather than to refuse the
+    second and make it invent a name that no longer describes the work.
+    claude-data-export-001 and claude-data-export-002 are two addresses for one
+    task, which is what the roster is being asked to show.
+
+    The lowest free number is taken rather than the next one up, so the
+    numbers a finished window frees come back into use and a task that
+    runs all day does not count off into the hundreds.
+
+    Args:
+        bus: Bus from connect().
+        stem: The name without a number, already checked.
+
+    Returns:
+        The numbered name.
+
+    Raises:
+        ValueError: Every number is held by a live session.
+    """
+    for number in range(1, NAME_NUMBER_LIMIT):
+        candidate = "%s-%03d" % (stem, number)
+        if _name_conflict(bus, candidate) is None:
+            return candidate
+    raise ValueError(
+        "%r already has %d live windows on it -- that is not a naming "
+        "problem" % (stem, NAME_NUMBER_LIMIT - 1))
+
+
 def set_name(bus, handle):
     """Publish a name for this session on the roster.
 
@@ -205,21 +249,37 @@ def set_name(bus, handle):
     is already looking at this file". A handle makes the second possible,
     so it is worth naming a window after the task it is on.
 
+    The name is published with a three-digit number on the end:
+    "codex-sso" becomes "codex-sso-001", and the next window on the same
+    task becomes "codex-sso-002". Naming is then something a window can
+    do without first looking to see who else is here, and the roster
+    never carries two windows the sender cannot tell apart. A handle
+    that already ends in a number is taken as meaning that particular
+    window and is published as written, or refused if it is held.
+
     Args:
         bus: Bus from connect().
         handle: The name to publish, e.g. "codex-sso".
 
     Returns:
-        The handle now in effect.
+        The handle now in effect, numbered.
 
     Raises:
-        ValueError: The name is malformed, or another live session or a
-            CLI already answers to it.
+        ValueError: The name is malformed, too long to carry a number,
+            or -- when it was written with one -- already answered to by
+            another live session or a CLI.
     """
     check_name(handle)
-    conflict = _name_conflict(bus, handle)
-    if conflict:
-        raise ValueError("%s -- pick another" % conflict)
+    if NAME_NUMBER.search(handle):
+        conflict = _name_conflict(bus, handle)
+        if conflict:
+            raise ValueError("%s -- pick another" % conflict)
+    else:
+        if len(handle) > NAME_STEM_MAX:
+            raise ValueError(
+                "%r leaves no room for the number on the end: use at "
+                "most %d characters" % (handle, NAME_STEM_MAX))
+        handle = _number_name(bus, handle)
     with open(_handle_path(bus.state, bus.session), "w") as target:
         target.write(handle)
     bus.handle = handle
