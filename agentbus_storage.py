@@ -7,6 +7,7 @@ import time
 import uuid
 
 import agentbus_constants as constants
+import agentbus_notify as notify
 
 
 def append(bus, record):
@@ -27,6 +28,10 @@ def append(bus, record):
             handle.flush()
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+    # Outside the lock on purpose: the doorbell is best effort and must
+    # never be holding the file other windows are waiting to write to.
+    notify.ring(record)
 
 
 def compact(bus):

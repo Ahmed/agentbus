@@ -2,8 +2,10 @@
 # Lint this repository: formatters rewrite in place, then checkers judge.
 #
 # Run it on the files you touched, or with no arguments to take every
-# Python file in the repository. The exit status is every checker's
-# status combined, so a clean run is exit 0 and nothing else.
+# Python file in the repository root and in tests/. The exit status is
+# every checker's status combined, so a clean run is exit 0 and nothing
+# else. Note that the formatters rewrite in place, so a bare run is not
+# a read-only check even when it reports nothing.
 #
 # The conventions it enforces: Google-style docstrings on everything
 # public, f-strings rather than percent formatting, an explicit encoding
@@ -17,7 +19,10 @@ cd "$SCRIPT_DIR"
 
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
-  mapfile -t TARGETS < <(find . -maxdepth 1 -name '*.py' -printf '%P\n' | sort)
+  mapfile -t TARGETS < <(
+    find . -maxdepth 2 -name '*.py' \
+      -not -path './.git/*' -not -path '*/__pycache__/*' \
+      -printf '%P\n' | sort)
 fi
 
 if [ ${#TARGETS[@]} -eq 0 ]; then

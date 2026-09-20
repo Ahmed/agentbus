@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Expose the shared file bus to shell commands."""
 
-import agentbus_context as context
 import json
 import os
 import pathlib
@@ -9,14 +8,15 @@ import sys
 import time
 
 import agentbus_constants as constants
+import agentbus_context as context
 import agentbus_delivery as delivery
 import agentbus_identity as identity
 import agentbus_messages as messages
+import agentbus_notify as notify
 import agentbus_presence as presence
 import agentbus_routing as routing
 import agentbus_state as state
 import agentbus_storage as storage
-
 import project_confirmation
 
 _CONTEXT_LOCKS = context.CONTEXT_LOCKS
@@ -43,9 +43,9 @@ default_handle = state.default_handle
 current_handle = state.current_handle
 check_name = state.check_name
 default_job = state.default_job
+session_dead = identity.session_dead
 session_pid = identity.session_pid
 bind_session = identity.bind_session
-session_dead = identity.session_dead
 consumed_ids = storage.consumed_ids
 record_task = storage.record_task
 get_task = storage.get_task
@@ -300,6 +300,71 @@ def _confirm_command(client, argv):
     return 0
 
 
+# How long a bare "wait" listens before giving up. Long enough that a
+# window armed once stays armed through an ordinary working session,
+# short enough that a forgotten listener does not live forever.
+WAIT_SECONDS = 3600.0
+
+# What to sleep between looks when there is no doorbell to block on. The
+# same interval the watcher polls at, for the same reason: a look is a
+# stat of one file.
+WAIT_POLL_SECONDS = 2.0
+
+
+def _wait_command(client, argv):
+    """Block until this window has mail, then exit so its CLI notices.
+
+    This is the one mechanism that reaches a window nobody is typing
+    into. A CLI that reports when a background command finishes will
+    surface this command's exit on its own, without the operator
+    pressing anything -- so arming it in the background and reading the
+    mail when it returns is delivery rather than a bell.
+
+    It returns on the first mail rather than looping, because exiting is
+    the whole signal. The caller reads its mail and arms another.
+
+    Args:
+        client (Bus): Connection for the calling window.
+        argv (list[str]): Wait command, the agent name, optional seconds.
+
+    Returns:
+        int: Zero when mail is waiting, one on a timeout, two on misuse.
+    """
+    if len(argv) < 2:
+        print("usage: bus.py wait <agent> [seconds]")
+        return 2
+
+    agent = _as_agent(client, argv[1])
+    try:
+        limit = float(argv[2]) if len(argv) > 2 else WAIT_SECONDS
+    except ValueError:
+        print("usage: bus.py wait <agent> [seconds]")
+        return 2
+
+    deadline = time.time() + limit
+    while True:
+        waiting = peek(client, agent, client.session)
+        if waiting:
+            kinds = ", ".join(sorted({item.get("kind", "message")
+                                      for item in waiting}))
+            print(f"{len(waiting)} waiting for {agent} ({kinds}). "
+                  f"Read with: bus.py read {agent}")
+            return 0
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            print(f"no mail for {agent} within {limit:.0f}s")
+            return 1
+
+        # A ring only says "look"; the loop above is what decides
+        # whether anything is actually here. Without a doorbell this
+        # falls back to the same polling the watcher does.
+        if not notify.wait(agent, client.session,
+                           min(remaining, WAIT_SECONDS)):
+            if not notify.enabled():
+                time.sleep(min(remaining, WAIT_POLL_SECONDS))
+
+
 def _utility_command(client, argv):
     """Handle administrative commands separately from message delivery.
 
@@ -324,8 +389,42 @@ def _utility_command(client, argv):
     else:
         print("usage: bus.py agents|watch|path|job [name]|name [handle]|"
               "send <from> <to> <text>|broadcast <from> <to> <text>|"
-              "read <agent>|register <agent>|confirm <agent> <id> yes|no")
+              "read <agent>|register <agent>|confirm <agent> <id> yes|no|"
+              "wait <agent> [seconds]")
         return 2
+    return 0
+
+
+def _agents_command(client):
+    """Print the roster, one window per line.
+
+    Args:
+        client (Bus): Connection for the calling window.
+
+    Returns:
+        int: Shell exit status.
+    """
+    for row in agents(client):
+        status = "online" if row["online"] else "offline"
+        print((
+            f'{row['handle']:<14} {row['name']:<8} {status:<9} job='
+            f'{row['job']:<22} unread={row['unread']!s:<3}'
+        ))
+    return 0
+
+
+def _read_command(client, argv):
+    """Consume and print this window's waiting mail.
+
+    Args:
+        client (Bus): Connection for the calling window.
+        argv (list[str]): Read command and the agent name.
+
+    Returns:
+        int: Shell exit status.
+    """
+    print(format_messages(receive_and_settle(
+        client, _as_agent(client, argv[1]), limit=50)) or "(no messages)")
     return 0
 
 
@@ -340,24 +439,15 @@ def _main(argv):
     """
     client = connect()
     command = argv[0] if argv else "agents"
+    handlers = {"send": _send_command, "broadcast": _send_command,
+                "name": _name_command, "confirm": _confirm_command,
+                "wait": _wait_command}
     if command == "agents":
-        for row in agents(client):
-            status = "online" if row["online"] else "offline"
-            print((
-                f'{row['handle']:<14} {row['name']:<8} {status:<9} job='
-                f'{row['job']:<22} unread={row['unread']!s:<3}'
-            ))
-        return 0
-    if command in ("send", "broadcast"):
-        return _send_command(client, argv)
+        return _agents_command(client)
     if command in ("read", "drain"):
-        print(format_messages(receive_and_settle(
-            client, _as_agent(client, argv[1]), limit=50)) or "(no messages)")
-        return 0
-    if command == "name":
-        return _name_command(client, argv)
-    if command == "confirm":
-        return _confirm_command(client, argv)
+        return _read_command(client, argv)
+    if command in handlers:
+        return handlers[command](client, argv)
     return _utility_command(client, argv)
 
 
@@ -374,8 +464,9 @@ def set_name(client, handle):
     """
     previous = state.read_handle(client.state, client.session) or ""
     published = presence.set_name(client, handle)
+    links = os.path.join(client.state, "project_links.json")
     if (NAME_NUMBER.sub("", previous) != NAME_NUMBER.sub("", published)
-            and os.path.exists(os.path.join(client.state, "project_links.json"))):
+            and os.path.exists(links)):
         project_confirmation.invalidate_relationships(client)
     return published
 
@@ -393,6 +484,7 @@ def set_job(client, job):
     """
     previous = client.job
     published = state.set_job(client, job)
+    os.path.join(client.state, "project_links.json")
     if (previous != published and os.path.exists(
             os.path.join(client.state, "project_links.json"))):
         project_confirmation.invalidate_relationships(client)

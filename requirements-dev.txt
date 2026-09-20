@@ -1,0 +1,8 @@
+# Versions used by the repository lint gate.
+autoflake==2.3.1
+isort==6.0.1
+autopep8==2.3.2
+flake8==7.2.0
+flake8-docstrings==1.7.0
+pydocstyle==6.3.0
+pylint==3.3.7

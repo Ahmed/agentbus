@@ -1,6 +1,5 @@
 """Associate CLI processes with conversation inboxes without merging."""
 
-import agentbus_context as context
 import errno
 import fcntl
 import json
@@ -8,6 +7,7 @@ import os
 import re
 
 import agentbus_constants as constants
+import agentbus_context as context
 import agentbus_state as state_store
 import agentbus_storage as storage
 
@@ -105,71 +105,6 @@ def _process_start(pid):
             return handle.read().rsplit(")", 1)[1].split()[19]
     except (IOError, OSError, IndexError):
         return None
-
-
-def _pid_alive(pid):
-    """Is there still a process with this pid?
-
-    EPERM counts as alive: the process exists and belongs to somebody
-    else, which is not a thing to reap.
-
-    Args:
-        pid (int): The process id to test.
-
-    Returns:
-        bool: True while the process exists.
-    """
-    try:
-        os.kill(pid, 0)
-    except OSError as error:
-        return error.errno == errno.EPERM
-    return True
-
-
-def session_dead(session, record=None):
-    """Is this session provably gone, rather than merely quiet?
-
-    The distinction is the whole point. A window sitting at an empty
-    prompt fires no hooks, so silence says nothing about whether it is
-    alive -- which is why the idle sweep has to wait an hour before
-    removing a row. But some rows can be *known* dead, and those should
-    not wait at all:
-
-    - A session keyed `pid1234` is a process that could not name itself.
-      The MCP server under Codex's shared app-server daemon is the case
-      that produces them, and it mints a new one every time it restarts.
-      The identity is the process, so if the process is gone the identity
-      is meaningless and the row is a ghost.
-    - Any presence record that noted the CLI window it belonged to can be
-      checked the same way, whatever its session id looks like.
-
-    Anything else returns False, meaning "no evidence", and falls through
-    to the ordinary idle sweep.
-
-    Pid reuse can in principle make a dead session look alive again. The
-    cost is one stale row surviving a while longer, which is what used to
-    happen to all of them, so it is not worth defending against.
-
-    Args:
-        session (str): The session id recorded on the presence row.
-        record (dict or None): That presence row, when it is to hand.
-
-    Returns:
-        bool: True only when the session is demonstrably gone.
-    """
-    record = record or {}
-    if session.startswith("pid"):
-        try:
-            return not _pid_alive(int(session[3:]))
-        except ValueError:
-            return False
-    window = record.get("window")
-    if window:
-        try:
-            return not _pid_alive(int(window))
-        except (TypeError, ValueError):
-            return False
-    return False
 
 
 def bound_session(state, key, pid):
@@ -369,7 +304,8 @@ def canonical_session(bus, session, generation=None):
             pass
         # Older bindings may predate the generation-specific history file.
         try:
-            with open(os.path.join(bus.state, f'session.{session!s}'), encoding="utf-8") as handle:
+            path = os.path.join(bus.state, f"session.{session}")
+            with open(path, encoding="utf-8") as handle:
                 record = json.load(handle)
             if record.get("start") == generation:
                 return record.get("session") or session
@@ -398,3 +334,68 @@ def session_generation(session):
     """
     match = re.fullmatch(r"(claude|codex|gemini|node)([0-9]+)", session or "")
     return _process_start(int(match.group(2))) if match else None
+
+
+def _pid_alive(pid):
+    """Is there still a process with this pid?
+
+    EPERM counts as alive: the process exists and belongs to somebody
+    else, which is not a thing to reap.
+
+    Args:
+        pid (int): The process id to test.
+
+    Returns:
+        bool: True while the process exists.
+    """
+    try:
+        os.kill(pid, 0)
+    except OSError as error:
+        return error.errno == errno.EPERM
+    return True
+
+
+def session_dead(session, record=None):
+    """Is this session provably gone, rather than merely quiet?
+
+    The distinction is the whole point. A window sitting at an empty
+    prompt fires no hooks, so silence says nothing about whether it is
+    alive -- which is why the idle sweep has to wait an hour before
+    removing a row. But some rows can be *known* dead, and those should
+    not wait at all:
+
+    - A session keyed `pid1234` is a process that could not name itself.
+      The MCP server under Codex's shared app-server daemon is the case
+      that produces them, and it mints a new one every time it restarts.
+      The identity is the process, so if the process is gone the identity
+      is meaningless and the row is a ghost.
+    - Any presence record that noted the CLI window it belonged to can be
+      checked the same way, whatever its session id looks like.
+
+    Anything else returns False, meaning "no evidence", and falls through
+    to the ordinary idle sweep.
+
+    Pid reuse can in principle make a dead session look alive again. The
+    cost is one stale row surviving a while longer, which is what used to
+    happen to all of them, so it is not worth defending against.
+
+    Args:
+        session (str): The session id recorded on the presence row.
+        record (dict or None): That presence row, when it is to hand.
+
+    Returns:
+        bool: True only when the session is demonstrably gone.
+    """
+    record = record or {}
+    if session.startswith("pid"):
+        try:
+            return not _pid_alive(int(session[3:]))
+        except ValueError:
+            return False
+    window = record.get("window")
+    if window:
+        try:
+            return not _pid_alive(int(window))
+        except (TypeError, ValueError):
+            return False
+    return False

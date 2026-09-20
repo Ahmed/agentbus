@@ -28,25 +28,13 @@ def _name_conflict(bus, handle):
     """
     for row in roster(bus):
         if handle == row["name"]:
-            return (
-                (
-                    f'{
-                    handle!r} is the CLI address for every {
-                    row['name']!s}' f' window; mail sent to it reaches all of them'
-                ))
-        if not row["online"]:
-            continue
-        if row.get("session") == bus.session:
+            return (f"{handle!r} is the CLI address for every {row['name']} "
+                    "window; mail sent to it reaches all of them")
+        if not row["online"] or row.get("session") == bus.session:
             continue
         if handle == row["handle"]:
-            return (
-                (
-                    f'{
-                    handle!r} is already published by a live session ' f'working on {
-                    row.get(
-                    'job',
-                    '?')!s}'
-                ))
+            return (f"{handle!r} is already published by a live session "
+                    f"working on {row.get('job', '?')}")
     return None
 
 
@@ -80,9 +68,9 @@ def _number_name(bus, stem):
     raise ValueError(
         (
             f'{
-            stem!r} already has {
-            constants.NAME_NUMBER_LIMIT -
-            1:d} live ' f'windows on it -- that is not a naming problem'
+                stem!r} already has {
+                constants.NAME_NUMBER_LIMIT -
+                1:d} live ' f'windows on it -- that is not a naming problem'
         ))
 
 
@@ -118,18 +106,15 @@ def set_name(bus, handle):
     if constants.NAME_NUMBER.search(handle):
         conflict = _name_conflict(bus, handle)
         if conflict:
-            raise ValueError(f'{conflict!s} -- pick another')
+            raise ValueError(f"{conflict} -- pick another")
     else:
         if len(handle) > constants.NAME_STEM_MAX:
             raise ValueError(
-                (
-                    f'{
-                    handle!r} leaves no room for the number on the end: ' f'use at most {
-                    constants.NAME_STEM_MAX:d} characters'
-                ))
+                f"{handle!r} leaves no room for the number on the end: use at "
+                f"most {constants.NAME_STEM_MAX} characters")
         handle = _number_name(bus, handle)
-    file_path = state.handle_path(bus.state, bus.session)
-    with open(file_path, "w", encoding="utf-8") as target:
+    path = state.handle_path(bus.state, bus.session)
+    with open(path, "w", encoding="utf-8") as target:
         target.write(handle)
     bus.handle = handle
     state.republish_handle(bus, handle)

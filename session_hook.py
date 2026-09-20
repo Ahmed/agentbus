@@ -60,6 +60,7 @@ import subprocess
 import sys
 import time
 
+import agentbus_notify as notify
 import bus
 
 # Hooks fire on every turn, so they take a small bite. A flood of mail
@@ -101,6 +102,41 @@ MAX_WAKES_PER_WINDOW = int(os.environ.get("AGENTBUS_MAX_WAKES", "10"))
 # Set AGENTBUS_WATCHER=0 to start no watcher, for anyone who wants the
 # hooks and not a background process per window.
 WATCHER_ENV = "AGENTBUS_WATCHER"
+
+# How long the end of a turn listens before letting the window go idle.
+#
+# This is the only moment a CLI gives us where waiting is useful. Once
+# the turn ends the window fires no hooks at all, so mail arriving a
+# second later waits for the operator; mail arriving while we are still
+# in this hook restarts the turn and is delivered without anyone
+# touching the keyboard. Holding the hook open therefore converts a
+# little latency at the end of each turn into real delivery for that
+# whole window.
+#
+# Per CLI, because the ceiling is the CLI's own hook timeout and a hook
+# killed for running long is worse than one that returned early. Codex
+# allows ten seconds, so eight leaves room for the rest of the hook.
+# Gemini fires no Stop event at all, so there is no moment to hold.
+# AGENTBUS_STOP_WAIT overrides any of this; zero switches it off.
+STOP_WAIT_DEFAULTS = {"codex": 8.0}
+
+
+def stop_wait(agent):
+    """How long this CLI's turn should listen before going idle.
+
+    Args:
+        agent (str): CLI name the window answers to.
+
+    Returns:
+        float: Seconds to hold the Stop hook open, or zero for none.
+    """
+    override = os.environ.get("AGENTBUS_STOP_WAIT")
+    if override:
+        try:
+            return max(0.0, float(override))
+        except ValueError:
+            return 0.0
+    return STOP_WAIT_DEFAULTS.get(agent, 0.0)
 
 
 def _start_watcher(client, agent):
@@ -145,6 +181,37 @@ def _start_watcher(client, agent):
         # A watcher that will not start must not break the attached
         # session. The hooks still deliver exactly as they did before.
         return None
+
+
+def waiting_for_wake(client, agent, listen):
+    """What this window has to wake for, listening briefly if nothing.
+
+    The listen is the point. By the time this runs the turn is over, and
+    a window that stops here hears nothing further until somebody types
+    at it -- so mail that arrives a second from now would wait for a
+    human. Holding on the doorbell for a moment means that message
+    restarts the turn instead, which is delivery rather than a bell.
+
+    Receipts do not count as something to wait for; an inbox holding
+    only acks is treated as empty so the listen still happens.
+
+    Args:
+        client (Bus): Connection for this window.
+        agent (str): CLI name whose mail to look at.
+        listen (float): Seconds to hold open when nothing is waiting.
+
+    Returns:
+        list[dict]: The mail waiting, after any listen. Never consumed
+            here -- a refused wake must leave it for an ordinary hook.
+    """
+    waiting = bus.peek(client, agent)
+    if any(item.get("kind") != "ack" for item in waiting):
+        return waiting
+    if listen <= 0:
+        return waiting
+    if not notify.wait(agent, client.session, listen):
+        return waiting
+    return bus.peek(client, agent)
 
 
 def _wake_path(client):
@@ -305,8 +372,9 @@ def _preamble(agent, messages, woken=False):
             "A [project_check] is only a question about what this window is "
             "working on. Confirm yes only if its named project matches your "
             "current work; otherwise confirm no. Use confirm_project or the "
-            "bus.py confirm command in the check. A receipt is not confirmation. "
-            "The task details remain withheld until you explicitly confirm.")
+            "bus.py confirm command in the check. A receipt is not "
+            "confirmation. The task details remain withheld until you "
+            "explicitly confirm.")
     lines.append("")
     lines.append(bus.format_messages(messages))
     return "\n".join(lines)
@@ -363,7 +431,8 @@ def main():
     # the same chain can be stranded despite no useful continuations.
     limit = HOOK_MESSAGE_LIMIT
     if waking:
-        waiting = bus.peek(client, options.agent)
+        waiting = waiting_for_wake(client, options.agent,
+                                   stop_wait(options.agent))
         first_action = next((index for index, message in enumerate(waiting)
                              if message.get("kind") != "ack"), None)
         if first_action is None:
@@ -378,6 +447,7 @@ def main():
     messages = bus.receive_and_settle(client, options.agent,
                                       limit=limit,
                                       fresh_only=True)
+
     if not messages:
         return 0
 

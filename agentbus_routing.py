@@ -91,11 +91,11 @@ def _route_choice(requested, rows, reason):
         choices = ", ".join(
             (
                 f'{
-                row['handle']!s} (job={
-                row.get(
-                'job',
-                '?')!s}, session=' f'{
-                row['session']!s})'
+                    row['handle']!s} (job={
+                    row.get(
+                        'job',
+                        '?')!s}, session=' f'{
+                    row['session']!s})'
             ) for row in rows)
         raise ValueError(
             (
@@ -168,7 +168,9 @@ def _reply_destination(client, original, rows, requested, reply_to):
         return _route_choice(requested, matches, "reply")
     if target != original["from"]:
         return {"to": target, "routing": "reply"}
-    raise ValueError(f"message {reply_to!r} has no window identity to reply to")
+    raise ValueError(
+        f"message {
+            reply_to!r} has no window identity to reply to")
 
 
 def _route_reply(client, sender, to, options, rows):
@@ -188,15 +190,18 @@ def _route_reply(client, sender, to, options, rows):
     if original and to in (original.get("from"), original.get("from_handle")):
         if not addressed_to(client, sender, original):
             raise ValueError(
-                f"message {options.reply_to!r} was not addressed to this window")
+                f"message {
+                    options.reply_to!r} was not addressed to this window")
         return _reply_destination(client, original, rows, to, options.reply_to)
-    broad = to in constants.AGENT_NAMES or any(row["agent"] == to for row in rows)
+    broad = to in constants.AGENT_NAMES or any(
+        row["agent"] == to for row in rows)
     if broad and original and to != original.get("from"):
         raise ValueError(f"reply destination {to!r} does not match "
                          f"the original sender {original.get('from')!r}")
     if broad and original is None:
-        raise ValueError(f"cannot find message {options.reply_to!r} to identify "
-                         "the reply window; use its full handle")
+        raise ValueError(
+            f"cannot find message {options.reply_to!r} to identify "
+            "the reply window; use its full handle")
     return None
 
 
@@ -222,7 +227,8 @@ def resolve_recipient(bus, sender, to, *args, **kwargs):
         reply = _route_reply(bus, sender, to, options, rows)
         if reply:
             return reply
-    broad = to in constants.AGENT_NAMES or any(row["agent"] == to for row in rows)
+    broad = to in constants.AGENT_NAMES or any(
+        row["agent"] == to for row in rows)
     if not broad:
         matches = [row for row in rows if row["handle"] == to]
         return (_route_choice(to, matches, "handle") if matches
@@ -230,8 +236,8 @@ def resolve_recipient(bus, sender, to, *args, **kwargs):
     candidates = [row for row in rows
                   if row["agent"] == to and row["session"] != bus.session]
     task = task_stem(state.current_handle(bus, sender), sender, bus.session)
-    matches = [row for row in candidates
-               if task and task_stem(row["handle"], to, row["session"]) == task]
+    matches = [row for row in candidates if task and task_stem(
+        row["handle"], to, row["session"]) == task]
     if matches:
         same_job = [row for row in matches if row.get("job") == bus.job]
         return _route_choice(to, same_job or matches, "task")
@@ -242,5 +248,6 @@ def resolve_recipient(bus, sender, to, *args, **kwargs):
                         for row in candidates) or "none registered"
     raise ValueError(
         f"no related {to} window for {state.current_handle(bus, sender)} "
-        f"(job={bus.job}). Available: {choices}. Use a full handle or matching "
+        f"(job={bus.job}). Available: {choices}. "
+        "Use a full handle or matching "
         "task names/jobs; use broadcast explicitly to reach every window.")

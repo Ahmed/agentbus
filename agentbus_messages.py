@@ -1,18 +1,17 @@
 """Publish and render envelopes shared by shell, hooks, and MCP clients."""
 
-import agentbus_context as context
 import collections
 import os
 import time
 import uuid
 
 import agentbus_constants as constants
+import agentbus_context as context
 import agentbus_identity as identity
 import agentbus_presence as presence
 import agentbus_routing as routing
 import agentbus_state as state_store
 import agentbus_storage as storage
-
 import project_confirmation
 
 _PrepareOptions = collections.namedtuple(
@@ -22,14 +21,7 @@ _PrepareOptions = collections.namedtuple(
 _DirectOptions = collections.namedtuple(
     "DirectOptions",
     'kind task_id reply_to job broadcast return_record reply_context',
-    defaults=(
-        'message',
-        None,
-        None,
-        None,
-        False,
-        False,
-        None))
+    defaults=("message", None, None, None, False, False, None))
 
 _SendOptions = collections.namedtuple(
     "SendOptions", 'kind task_id reply_to job broadcast return_record',
@@ -49,9 +41,13 @@ def send(bus, sender, to, text, *args, **kwargs):
         sender (str): CLI name publishing the message.
         to (str): CLI name, full handle, or explicit broadcast wildcard.
         text (str): Message body to publish.
-        args (object): Optional compatibility settings in their documented
-            order.
-        **kwargs (object): Optional routing and response settings by name.
+        *args (object): Optional kind, task_id, reply_to, job, broadcast,
+            and return_record values, in that order. Kind defaults to
+            "message"; broadcast and return_record default to False.
+        **kwargs (object): The same optional fields supplied by name.
+
+    Returns:
+        str or dict: Id, or routing metadata when return_record is true.
     """
     options = _SendOptions(*args, **kwargs)
     record = prepare_message(
@@ -73,13 +69,10 @@ def send(bus, sender, to, text, *args, **kwargs):
 
 
 def format_messages(messages):
-    """Render messages as plain text for injection into a session.
-
-    Age is on every line so a reader can see at a glance whether a message
-    belongs to what is happening now.
+    """Render messages with their age so recipients can judge stale context.
 
     Args:
-        messages (list[dict]): Message envelopes delivered to this window.
+        messages (list[dict]): Envelopes delivered to this window.
 
     Returns:
         str: Message block suitable for a hook or terminal.
@@ -87,30 +80,18 @@ def format_messages(messages):
     lines = []
     for message in messages:
         sender = message.get("from_handle") or message.get("from", "?")
-        age = int(time.time() - message.get("ts", time.time()))
-        # A receipt has no body worth printing: who read what, and when.
+        age = max(int(time.time() - message.get("ts", time.time())), 0)
         if message.get("kind") == "ack":
+            reply_to = message.get("reply_to", "?")
             lines.append(
-                (
-                    f'[ack] {
-                    sender!s} read your message ' f'{
-                    message.get(
-                    'reply_to',
-                    '?')!s} ({
-                    max(
-                    age,
-                    0):d}s ago)'
-                ))
+                f"[ack] {sender} read your message {reply_to} ({age}s ago)")
             lines.append("")
             continue
-        header = f'[{message.get('kind', 'message')!s}] from {sender!s}'
+        header = f"[{message.get('kind', 'message')}] from {sender}"
         if message.get("task_id"):
-            header += f' ({message['task_id']!s})'
-        header += f' id={message.get('id', '?')!s}'
-        header += f' ({max(age, 0):d}s ago)'
-        lines.append(header)
-        lines.append(message.get("text", ""))
-        lines.append("")
+            header += f" ({message['task_id']})"
+        header += f" id={message.get('id', '?')} ({age}s ago)"
+        lines.extend((header, message.get("text", ""), ""))
     return "\n".join(lines).strip()
 
 
@@ -148,7 +129,7 @@ def prepare_message(bus, sender, to, text, *args, **kwargs):
         sender (str): CLI name publishing the message.
         to (str): CLI name, full handle, or explicit broadcast wildcard.
         text (str): Message body to publish.
-        args (object): Optional compatibility settings in their documented
+        *args (object): Optional compatibility settings in their documented
             order.
         **kwargs (object): Optional routing and response settings by name.
 
@@ -216,7 +197,7 @@ def send_direct(bus, sender, to, text, *args, **kwargs):
         sender (str): CLI name publishing the message.
         to (str): CLI name, full handle, or explicit broadcast wildcard.
         text (str): Message body to publish.
-        args (object): Optional compatibility settings in their documented
+        *args (object): Optional compatibility settings in their documented
             order.
         **kwargs (object): Optional routing and response settings by name.
 

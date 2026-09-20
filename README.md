@@ -213,7 +213,10 @@ acknowledged, so two windows reading each other do not trade them forever.
 
 | File | What it is |
 | --- | --- |
-| `bus.py` | The bus: append, read, presence, tasks. Also a shell CLI. |
+| `bus.py` | Public bus API and shell CLI. |
+| `agentbus_notify.py` | The Redis doorbell: rings a window when mail lands, and blocks a listener until one arrives. Carries no contents. |
+| `tests/` | The test suite, plus the fixtures it shares. Discovered from the repository root. |
+| `agentbus_*.py` | Bus implementation modules and shared test helpers. |
 | `project_confirmation.py` | Holds content until project confirmation and remembers confirmed session pairs. |
 | `agentbus_server.py` | MCP server. One process per session, named by `--agent`. |
 | `session_hook.py` | Session hook that delivers waiting mail into a conversation, and wakes a Claude or Codex turn that was about to end. Speaks all three CLIs' hook dialects. |
@@ -365,6 +368,39 @@ a project check without pretending it has recently been active.
 - `AGENTBUS_WATCHER_LOG=<file>` enables diagnostic logs. The detached
   process does not print to its inherited descriptors.
 
+## Requirements
+
+**Redis is required.** It must be installed and running before the bus is
+useful.
+
+```bash
+sudo apt install redis-server      # Debian / Ubuntu
+python3 -m pip install -r requirements.txt
+redis-cli ping                     # expect: PONG
+```
+
+Messages themselves live in the file, not in Redis. What Redis carries is
+the doorbell: a ring, with no contents, saying *look at the bus*. That
+sounds minor and is not, because a blocking subscribe is the only thing
+that reaches a window nobody is typing into. A window sitting at an empty
+prompt fires no hooks, so without the doorbell it learns about mail only
+when its operator next presses a key.
+
+Point `AGENTBUS_REDIS_URL` elsewhere to use a different server, which is
+also how windows on two machines reach each other. The default is
+`redis://127.0.0.1:6379/5` — database 5 to stay out of the way of
+anything else on that server.
+
+The database number is a courtesy, not isolation: Redis pub/sub is not
+scoped per database, so channels are visible across all of them whatever
+number you choose. What actually keeps the bus from colliding with
+another application is that every channel is named `agentbus:...`.
+
+If Redis is missing the bus falls back to polling instead of failing, so
+nothing is lost and no message goes astray. That fallback exists so a
+broken Redis cannot take the bus down with it -- not as a supported way
+to run. Delivery to an idle window stops working without it.
+
 ## Installing
 
 Hooks must be installed by hand — Claude is not permitted to edit the
@@ -495,6 +531,19 @@ routing, project confirmations and explicit broadcasts, preservation of
 unread mail during identity migration, roster counts, and continuation
 budgets. They do not start live agents or
 send mail to the real bus.
+
+## Linting
+
+Install the development tools and run the local style checks:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+./linit.sh
+```
+
+The script removes unused imports, sorts imports, and formats Python files
+in place before running Flake8, Google-style docstring checks, and Pylint.
+Pass file paths to limit a run, for example `./linit.sh bus.py`.
 
 ## License
 

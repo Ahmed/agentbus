@@ -10,9 +10,14 @@ import agentbus_state as state
 
 # Long-lived integrations and shell entry points must share nested flock
 # ownership even when they load the bus and confirmation modules separately.
-CONTEXT_LOCKS = (getattr(sys.modules.get("bus"), "_CONTEXT_LOCKS", None)
-                 or getattr(sys.modules.get("__main__"), "_CONTEXT_LOCKS", None)
-                 or threading.local())
+CONTEXT_LOCKS = (
+    getattr(
+        sys.modules.get("bus"),
+        "_CONTEXT_LOCKS",
+        None) or getattr(
+            sys.modules.get("__main__"),
+            "_CONTEXT_LOCKS",
+        None) or threading.local())
 
 
 def _locked_call(function, client, *args, **kwargs):
