@@ -535,6 +535,12 @@ def _live_addressees(bus, to):
         session = record.get("session")
         if not session:
             continue
+        # A row can be inside the heartbeat window and still belong to a
+        # process that has since exited. Counting it as an addressee
+        # would hold the message open for a reader that can never read,
+        # so it could only ever leave the bus by expiring.
+        if session_dead(session, record):
+            continue
         agent = record.get("agent", "")
         handle_name = record.get("handle") or default_handle(agent, session)
         if to in (agent, handle_name):
@@ -869,6 +875,14 @@ def touch(bus, agent, status=None, **info):
     record["job"] = bus.job
     record["agent"] = agent
     record["handle"] = current_handle(bus, agent)
+    # The CLI process this row belongs to, when it can be found, so the
+    # row can later be shown to be dead rather than merely quiet. Only
+    # written when known: a hook can see the window above it, while a
+    # server started by a shared daemon cannot, and overwriting a good
+    # answer with None would lose the one chance to record it.
+    window = session_pid()
+    if window:
+        record["window"] = window
     if status:
         record["status"] = status
     for name, value in info.items():
@@ -889,6 +903,58 @@ def register(bus, agent, **info):
     defaults = {"pid": os.getpid(), "cwd": os.getcwd()}
     defaults.update(info)
     return touch(bus, agent, status=status, **defaults)
+
+
+def _pid_alive(pid):
+    """Is there still a process with this pid?
+
+    EPERM counts as alive: the process exists and belongs to somebody
+    else, which is not a thing to reap.
+    """
+    try:
+        os.kill(pid, 0)
+    except OSError as error:
+        return error.errno == errno.EPERM
+    return True
+
+
+def session_dead(session, record=None):
+    """Is this session provably gone, rather than merely quiet?
+
+    The distinction is the whole point. A window sitting at an empty
+    prompt fires no hooks, so silence says nothing about whether it is
+    alive -- which is why the idle sweep has to wait an hour before
+    removing a row. But some rows can be *known* dead, and those should
+    not wait at all:
+
+    - A session keyed `pid1234` is a process that could not name itself.
+      The MCP server under Codex's shared app-server daemon is the case
+      that produces them, and it mints a new one every time it restarts.
+      The identity is the process, so if the process is gone the identity
+      is meaningless and the row is a ghost.
+    - Any presence record that noted the CLI window it belonged to can be
+      checked the same way, whatever its session id looks like.
+
+    Anything else returns False, meaning "no evidence", and falls through
+    to the ordinary idle sweep.
+
+    Pid reuse can in principle make a dead session look alive again. The
+    cost is one stale row surviving a while longer, which is what used to
+    happen to all of them, so it is not worth defending against.
+    """
+    record = record or {}
+    if session.startswith("pid"):
+        try:
+            return not _pid_alive(int(session[3:]))
+        except ValueError:
+            return False
+    window = record.get("window")
+    if window:
+        try:
+            return not _pid_alive(int(window))
+        except (TypeError, ValueError):
+            return False
+    return False
 
 
 def _discard(bus, name):
@@ -950,7 +1016,10 @@ def agents(bus):
         except (IOError, OSError, ValueError):
             continue
         idle = now - record.get("last_seen", 0)
-        if idle >= PRESENCE_REAP_SECONDS:
+        # Two reasons to delete a row. Being provably dead is checked
+        # first and ignores the clock: an hour of a ghost on the roster
+        # is an hour of a name somebody might address mail to.
+        if idle >= PRESENCE_REAP_SECONDS or session_dead(session, record):
             _discard(bus, name)
             _discard(bus, "cursor.%s.%s" % (agent, session))
             continue
