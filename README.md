@@ -193,3 +193,7 @@ torn line would be unparseable for every reader, permanently.
 
 A bus failure never breaks a coding session — the hook exits 0 with no
 output if anything goes wrong.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
