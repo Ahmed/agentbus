@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/ahmed/.gemini-mcp-venv/bin/python /home/ahmed/source_code/agentbus/session_hook.py --agent claude",
+            "timeout": 10
+          }
+        ],
+        "matcher": "startup|resume|clear"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/ahmed/.gemini-mcp-venv/bin/python /home/ahmed/source_code/agentbus/session_hook.py --agent claude",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/ahmed/.gemini-mcp-venv/bin/python /home/ahmed/source_code/agentbus/session_hook.py --agent claude",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

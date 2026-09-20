@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/ahmed/.gemini-mcp-venv/bin/python /home/ahmed/source_code/agentbus/session_hook.py --agent gemini",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "BeforeAgent": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/ahmed/.gemini-mcp-venv/bin/python /home/ahmed/source_code/agentbus/session_hook.py --agent gemini",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/ahmed/.gemini-mcp-venv/bin/python /home/ahmed/source_code/agentbus/session_hook.py --agent gemini",
+            "timeout": 10000
+          }
+        ],
+        "matcher": ".*"
+      }
+    ]
+  }
+}
