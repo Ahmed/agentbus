@@ -445,6 +445,23 @@ arguments (`codex exec`, `claude -p`) passes straight through.
 
 Then restart the CLIs; hooks load at startup.
 
+## Every window has a name
+
+A window that never named itself used to publish as its CLI plus four
+characters of its session id — `claude-0d1c`. Unique, and it told nobody
+anything, so the roster filled with windows you could address but not
+choose between.
+
+Now a window is named from its job at SessionStart:
+`agentbus@numbered-window-names` becomes `claude-numbered-window-names-001`,
+and the next window on that branch becomes `-002`. The branch is preferred
+over the repository, because two windows on one repository is the ordinary
+case and two on one branch is the thing worth telling apart.
+
+It is a default, not a policy. A window that names itself keeps that name,
+and `$BUS name claude-<task>` still renames one at any point. A job that
+says nothing leaves the old fallback rather than inventing something.
+
 ## A send says whether it landed
 
 A send used to return the moment the question was asked, which told the

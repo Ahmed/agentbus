@@ -56,6 +56,7 @@ because a broken message bus must never stop someone coding.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -137,6 +138,64 @@ def stop_wait(agent):
         except ValueError:
             return 0.0
     return STOP_WAIT_DEFAULTS.get(agent, 0.0)
+
+
+def name_from_job(agent, job):
+    """A window name taken from the work the window is sitting in.
+
+    A window that has not named itself is published as its CLI plus four
+    characters of its session id -- claude-0d1c -- which is unique and
+    tells nobody anything. The job already says what the window is on,
+    so it is a better name than a hex fragment, and it is available
+    before the model has done or said anything.
+
+    The branch is preferred over the repository because two windows on
+    one repository are the common case and two on one branch is the
+    thing worth distinguishing.
+
+    Args:
+        agent (str): CLI name the window answers to.
+        job (str): The job, conventionally "repo@branch".
+
+    Returns:
+        str or None: A name stem to ask for, or None when the job says
+            nothing worth publishing.
+    """
+    if not job:
+        return None
+    repo, _, branch = job.partition("@")
+    stem = branch or repo
+    stem = re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")
+    if not stem or stem in ("unknown", "none"):
+        return None
+    return f"{agent}-{stem}"[:bus.NAME_STEM_MAX].rstrip("-")
+
+
+def autoname(client, agent):
+    """Name this window after its job, unless it has chosen a name.
+
+    Done once at SessionStart and never again, so a window that renames
+    itself keeps that name for the rest of its life. A failure here is
+    not worth a word: the window simply keeps the fallback it had.
+
+    Args:
+        client (Bus): Connection for this window.
+        agent (str): CLI name the window answers to.
+
+    Returns:
+        str: The handle now published.
+    """
+    current = bus.current_handle(client, agent)
+    if current != bus.default_handle(agent, client.session):
+        return current
+
+    stem = name_from_job(agent, client.job)
+    if not stem:
+        return current
+    try:
+        return bus.set_name(client, stem)
+    except ValueError:
+        return current
 
 
 def _start_watcher(client, agent):
@@ -420,6 +479,7 @@ def main():
                  session=payload.get("session_id"))
 
     if event == "SessionStart":
+        autoname(client, options.agent)
         _start_watcher(client, options.agent)
 
     if event in TURN_START_EVENTS:

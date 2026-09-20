@@ -53,6 +53,33 @@ BELL = b"\a"
 # land in the middle of the window's display.
 LOG_ENV = "AGENTBUS_WATCHER_LOG"
 
+# The CLIs that can be made to start a turn from outside, and the command
+# that does it. Codex hosts its sessions in a shared app-server daemon,
+# and a thread that daemon holds can be handed a queued message which
+# begins a turn -- so for codex alone, mail can be delivered to a window
+# nobody is typing into rather than merely rung about.
+#
+# The agentbus session id is the codex thread id, which is what makes
+# this a lookup rather than a search.
+#
+# Two conditions the daemon imposes, both of which fail quietly here: the
+# thread must still be loaded in memory, and it must not be interrupted.
+# A window that has exited leaves a queued message pending with no expiry
+# of its own, so this is only ever sent for mail already waiting.
+WAKE_COMMANDS = {"codex": ("codex", "queue", "--thread")}
+
+# Set AGENTBUS_WAKE=0 to ring without ever starting a turn.
+WAKE_ENV = "AGENTBUS_WAKE"
+
+# A wake is a subprocess talking to a daemon over a socket. Bounded so a
+# daemon that has stopped answering costs one poll, not the watcher.
+WAKE_TIMEOUT_SECONDS = 15.0
+
+# Quoted into the wake message so the window is told exactly how to
+# collect its mail, from wherever this copy of the bus lives.
+BUS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "bus.py")
+
 # How long to wait for the notifier before giving up on it. Generous for
 # something that normally returns in milliseconds, and short enough that
 # a broken session bus costs one poll rather than the whole watcher.
@@ -171,6 +198,52 @@ def _notify(handle_name, messages, notifier):
         pass
 
 
+def wake(agent, session, messages):
+    """Ask this window's CLI to start a turn, where that is possible.
+
+    The bell exists because nothing could do this. Where something can,
+    it is strictly better: the window reads its mail and answers without
+    the operator being involved at all.
+
+    Says only that mail is waiting. The contents stay on the bus, so a
+    queued wake that fires late cannot put a stale message in front of
+    the model as though it had just arrived -- and, for a message still
+    held, cannot disclose what the window has not agreed to receive.
+
+    Args:
+        agent (str): CLI name the window answers to.
+        session (str): That window's session, which for codex is also
+            its thread id.
+        messages (list[dict]): The mail being rung about.
+
+    Returns:
+        bool: True when the wake was accepted. False when this CLI has
+            no wake, when it is switched off, or when the daemon refused
+            -- each of which leaves the bell to do what it always did.
+    """
+    if os.environ.get(WAKE_ENV) == "0":
+        return False
+    command = WAKE_COMMANDS.get(agent)
+    if not command or not session:
+        return False
+    if shutil.which(command[0]) is None:
+        return False
+
+    text = (f"Agent bus: {len(messages)} message(s) are waiting for this "
+            "window. Nobody typed this -- the bus started your turn "
+            f"because mail arrived. Read it with: python3 {BUS_PATH} "
+            f"read {agent}")
+    try:
+        finished = subprocess.run([*command, session, "--message", text],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL,
+                                  timeout=WAKE_TIMEOUT_SECONDS,
+                                  check=False)
+    except (IOError, OSError, subprocess.TimeoutExpired):
+        return False
+    return finished.returncode == 0
+
+
 def _log(message):
     """Write a line somewhere findable, when asked to.
 
@@ -285,12 +358,17 @@ def main():
 
         if ripe:
             handle_name = bus.current_handle(client, options.agent)
-            if options.bell:
+            # Starting a turn is tried first. A window that wakes and
+            # reads does not need to be rung, and ringing it anyway is
+            # noise for an operator who was never required.
+            woken = wake(options.agent, options.session, ripe)
+            if not woken and options.bell:
                 _ring(tty)
-            if notifier:
+            if not woken and notifier:
                 _notify(handle_name, ripe, notifier)
             announced.update(record["id"] for record in ripe)
-            _log("observed unread " + ",".join(r["id"] for r in ripe))
+            _log(("woke for " if woken else "observed unread ")
+                 + ",".join(r["id"] for r in ripe))
 
         time.sleep(POLL_SECONDS)
 

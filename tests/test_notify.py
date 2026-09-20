@@ -6,6 +6,7 @@ with no doorbell still works. The second only runs where a Redis is
 actually reachable, since a ring that nobody can publish proves nothing.
 """
 
+import os
 import threading
 import time
 import unittest
@@ -15,6 +16,7 @@ import agentbus_notify as notify
 import bus
 import session_hook
 import tests.agentbus_test_utils as fixtures
+import watcher
 
 
 def _redis_available():
@@ -185,6 +187,114 @@ class NotifyWithRedisTests(fixtures.BusFixture):
         listener.join(timeout=10)
 
         self.assertFalse(self.answered)
+
+
+class WindowNameTests(fixtures.BusFixture):
+    """Every window gets a name that says something about its work."""
+
+    TEMP_PREFIX = "agentbus-name-test-"
+    DEFAULT_JOB = "agentbus@numbered-window-names"
+
+    def test_the_branch_is_preferred_over_the_repository(self):
+        """Two windows on one repo are common; one branch is the split."""
+        self.assertEqual(
+            session_hook.name_from_job("claude", "agentbus@my-branch"),
+            "claude-my-branch")
+
+    def test_a_job_without_a_branch_uses_the_repository(self):
+        """A bare job name is still better than four hex characters."""
+        self.assertEqual(
+            session_hook.name_from_job("codex", "scratchpad"),
+            "codex-scratchpad")
+
+    def test_awkward_characters_become_a_usable_name(self):
+        """A branch name is not required to be a legal handle."""
+        self.assertEqual(
+            session_hook.name_from_job("claude", "repo@feature/JIRA-9_x"),
+            "claude-feature-jira-9-x")
+
+    def test_a_long_branch_is_trimmed_to_leave_room_for_a_number(self):
+        """The name must still fit once a three-digit suffix is added."""
+        name = session_hook.name_from_job(
+            "claude", "repo@" + "a-very-long-branch-name" * 3)
+
+        self.assertLessEqual(len(name), bus.NAME_STEM_MAX)
+        self.assertFalse(name.endswith("-"))
+
+    def test_a_job_that_says_nothing_leaves_the_fallback(self):
+        """With no job there is nothing better than the generated handle."""
+        self.assertIsNone(session_hook.name_from_job("claude", ""))
+        self.assertIsNone(session_hook.name_from_job("claude", "unknown"))
+
+    def test_an_unnamed_window_is_named_after_its_job(self):
+        """A window that never named itself still gets a real name."""
+        window = bus.connect(self.directory, session="fresh-session",
+                             cwd=os.path.join(self.directory, "fresh"))
+        bus.set_job(window, self.DEFAULT_JOB)
+        bus.register(window, "claude")
+
+        named = session_hook.autoname(window, "claude")
+
+        self.assertTrue(named.startswith("claude-numbered-window-names"))
+
+    def test_a_window_that_chose_a_name_keeps_it(self):
+        """Naming is a decision, and SessionStart must not overrule it."""
+        window = self.window("chosen-session", "claude", "claude-sso-login")
+
+        named = session_hook.autoname(window, "claude")
+
+        self.assertEqual(named, "claude-sso-login-001")
+
+
+class WakeTests(unittest.TestCase):
+    """Starting a turn from outside, where a CLI allows it."""
+
+    def test_only_codex_has_a_wake_command(self):
+        """Claude and gemini have no way in, so they must not claim one."""
+        self.assertIn("codex", watcher.WAKE_COMMANDS)
+        self.assertNotIn("claude", watcher.WAKE_COMMANDS)
+        self.assertNotIn("gemini", watcher.WAKE_COMMANDS)
+
+    def test_a_cli_without_a_wake_is_not_woken(self):
+        """An unknown CLI falls back to the bell rather than guessing."""
+        self.assertFalse(watcher.wake("gemini", "session", [{"id": "a"}]))
+
+    def test_a_window_with_no_session_is_not_woken(self):
+        """Without a thread id there is nothing to address."""
+        self.assertFalse(watcher.wake("codex", "", [{"id": "a"}]))
+
+    @mock.patch.dict("os.environ", {"AGENTBUS_WAKE": "0"})
+    def test_the_wake_can_be_switched_off(self):
+        """AGENTBUS_WAKE=0 leaves the bell as the only signal."""
+        self.assertFalse(watcher.wake("codex", "thread", [{"id": "a"}]))
+
+    @mock.patch.object(watcher.subprocess, "run")
+    @mock.patch.object(watcher.shutil, "which", return_value="/usr/bin/codex")
+    def test_the_wake_names_the_thread_and_withholds_the_mail(
+            self, _which, run):
+        """It says mail is waiting; it never carries the mail itself."""
+        run.return_value.returncode = 0
+
+        woken = watcher.wake("codex", "thread-1",
+                             [{"id": "a", "text": "SECRET PAYLOAD"}])
+
+        self.assertTrue(woken)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:4], ["codex", "queue", "--thread", "thread-1"])
+        self.assertNotIn("SECRET PAYLOAD", " ".join(argv))
+
+    @mock.patch.object(watcher.subprocess, "run")
+    @mock.patch.object(watcher.shutil, "which", return_value="/usr/bin/codex")
+    def test_a_refusing_daemon_is_not_a_wake(self, _which, run):
+        """A non-zero exit means the window was left for the bell."""
+        run.return_value.returncode = 1
+
+        self.assertFalse(watcher.wake("codex", "thread-1", [{"id": "a"}]))
+
+    @mock.patch.object(watcher.shutil, "which", return_value=None)
+    def test_a_missing_codex_binary_is_not_a_wake(self, _which):
+        """Nothing to run means nothing claimed."""
+        self.assertFalse(watcher.wake("codex", "thread-1", [{"id": "a"}]))
 
 
 if __name__ == "__main__":
