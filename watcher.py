@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 
+import agentbus_notify as notify
 import bus
 
 # How often to look. The cost of a look is a stat of one file and, only
@@ -35,6 +36,15 @@ import bus
 # minute TTL so enabled notifications can arrive before expiry.
 POLL_SECONDS = 2.0
 
+# The doorbell means a look no longer has to be scheduled: a subscriber
+# blocks until the instant something is appended. This is the ceiling on
+# how long that block lasts, not how often anything is checked -- the
+# loop wakes on the ring, or on this, whichever comes first.
+#
+# Kept short anyway, because expiry runs on a clock and a window ringing
+# about mail should notice when that mail goes away.
+LISTEN_SECONDS = 20.0
+
 # How long a message must sit unread before it is worth ringing about.
 # A window that is mid-task runs a tool every few seconds and its
 # PostToolUse hook collects the mail without anyone's help; ringing for
@@ -42,6 +52,15 @@ POLL_SECONDS = 2.0
 # that is genuinely stuck, which is what it still being here after this
 # long means.
 GRACE_SECONDS = 5.0
+
+# Waking waits far less, because it is not the same act. A bell
+# interrupts a person and is worth being sure about; starting a turn
+# costs a window a few seconds of its own time, is silent, and queues
+# harmlessly behind whatever that window is already doing. Being early
+# and occasionally unnecessary is the cheap direction to be wrong in,
+# and waiting five seconds to deliver something that arrived in seventy
+# milliseconds is the expensive one.
+WAKE_GRACE_SECONDS = 0.5
 
 # Asks the terminal for a bell. A bell is the only thing worth writing to
 # a tty that a TUI owns: it produces no glyph, so it cannot corrupt the
@@ -261,15 +280,22 @@ def _log(message):
         pass
 
 
-def _ripe(waiting, first_seen, announced, now):
-    """The mail that has sat unread long enough to be worth a bell.
+def _ripe(waiting, first_seen, announced, now, grace):
+    """The mail that has sat unread long enough to act on.
 
     Also forgets anything that has left the bus, so the same window can
     be rung again if that sender writes again later. Both dictionaries
     are updated in place.
 
+    Args:
+        waiting (list[dict]): The mail currently on the bus for us.
+        first_seen (dict): When each id was first observed, updated here.
+        announced (set): Ids already acted on.
+        now (float): The current time.
+        grace (float): How long a message must have waited to count.
+
     Returns:
-        The records to ring about, in the order the bus holds them.
+        The records to act on, in the order the bus holds them.
     """
     present = set()
     ready = []
@@ -281,7 +307,7 @@ def _ripe(waiting, first_seen, announced, now):
         first_seen.setdefault(key, now)
         if key in announced:
             continue
-        if now - first_seen[key] >= GRACE_SECONDS:
+        if now - first_seen[key] >= grace:
             ready.append(record)
 
     for key in list(first_seen):
@@ -354,7 +380,12 @@ def main():
             # over; the next look will find whatever is there.
             waiting = []
 
-        ripe = _ripe(waiting, first_seen, announced, time.time())
+        # Two thresholds over one scan: anything ripe enough to wake,
+        # and the older subset that has earned an interruption.
+        now = time.time()
+        ripe = _ripe(waiting, first_seen, announced, now,
+                     WAKE_GRACE_SECONDS)
+        loud = _ripe(waiting, first_seen, announced, now, GRACE_SECONDS)
 
         if ripe:
             handle_name = bus.current_handle(client, options.agent)
@@ -362,15 +393,20 @@ def main():
             # reads does not need to be rung, and ringing it anyway is
             # noise for an operator who was never required.
             woken = wake(options.agent, options.session, ripe)
-            if not woken and options.bell:
+            if not woken and loud and options.bell:
                 _ring(tty)
-            if not woken and notifier:
-                _notify(handle_name, ripe, notifier)
-            announced.update(record["id"] for record in ripe)
-            _log(("woke for " if woken else "observed unread ")
-                 + ",".join(r["id"] for r in ripe))
+            if not woken and loud and notifier:
+                _notify(handle_name, loud, notifier)
+            if woken or loud:
+                announced.update(record["id"] for record in ripe)
+                _log(("woke for " if woken else "observed unread ")
+                     + ",".join(r["id"] for r in ripe))
 
-        time.sleep(POLL_SECONDS)
+        # Block on the doorbell rather than sleeping through it. Without
+        # a doorbell this falls back to the interval it always used.
+        if not notify.wait(options.agent, options.session, LISTEN_SECONDS):
+            if not notify.enabled():
+                time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":

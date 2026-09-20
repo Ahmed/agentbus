@@ -320,10 +320,12 @@ def _report_outcome(client, record, seconds):
         if remaining <= 0:
             break
         # The status is written by the other window, and every write to
-        # the bus rings. Sleeping on that beats spinning on the file.
+        # the bus rings, so this returns the moment there is something
+        # to look at rather than on a timer.
         if not notify.wait(_as_agent(client, record["from"]),
-                           client.session, min(remaining, 2.0)):
-            time.sleep(min(max(remaining, 0), 0.5))
+                           client.session, remaining):
+            if not notify.enabled():
+                time.sleep(min(max(remaining, 0), 0.25))
 
     for check in pending:
         print(f'{check['to']}: no answer yet, nothing shared so far',
@@ -378,7 +380,7 @@ def _confirm_command(client, argv):
 # How long a send waits to find out whether its message landed, before
 # saying so and returning. Short: the sender is usually an agent part
 # way through a turn, and the answer is worth a moment but not a stall.
-SEND_WAIT_SECONDS = float(os.environ.get("AGENTBUS_SEND_WAIT", "12"))
+SEND_WAIT_SECONDS = float(os.environ.get("AGENTBUS_SEND_WAIT", "6"))
 
 # How long a bare "wait" listens before giving up. Long enough that a
 # window armed once stays armed through an ordinary working session,
