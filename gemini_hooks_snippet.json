@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/ahmed/.gemini-mcp-venv/bin/python /home/ahmed/source_code/agentbus/session_hook.py --agent gemini",
+            "command": "python3 __AGENTBUS_DIR__/session_hook.py --agent gemini",
             "timeout": 10000
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/ahmed/.gemini-mcp-venv/bin/python /home/ahmed/source_code/agentbus/session_hook.py --agent gemini",
+            "command": "python3 __AGENTBUS_DIR__/session_hook.py --agent gemini",
             "timeout": 10000
           }
         ]
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/ahmed/.gemini-mcp-venv/bin/python /home/ahmed/source_code/agentbus/session_hook.py --agent gemini",
+            "command": "python3 __AGENTBUS_DIR__/session_hook.py --agent gemini",
             "timeout": 10000
           }
         ],

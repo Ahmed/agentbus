@@ -11,7 +11,7 @@ reach you through `/tmp/agentbus/bus.jsonl`, one JSON message per line.
 
 Let `BUS` mean:
 
-    /home/ahmed/.gemini-mcp-venv/bin/python /home/ahmed/source_code/agentbus/bus.py
+    python3 /path/to/agentbus/bus.py
 
 **Read your new messages** — each read advances your own position, so you
 see each message once and other sessions still get their own copy:

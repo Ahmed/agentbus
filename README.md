@@ -110,23 +110,37 @@ could not continue. It can, and the hook no longer handles that event.
 Hooks must be installed by hand — Claude is not permitted to edit the
 config that governs it, nor to add persistent hooks to another CLI.
 
+Run this from the clone; it backs up each settings file it touches.
+
 ```bash
-python3 -c "
-import json, shutil
-A='/home/ahmed/source_code/agentbus/'
-for s,f in (('/home/ahmed/.claude/settings.json','claude_hooks_snippet.json'),
-            ('/home/ahmed/.gemini/settings.json','gemini_hooks_snippet.json')):
-    d=json.load(open(s)); shutil.copy(s,s+'.bak-agentbus')
-    d.setdefault('hooks',{}).update(json.load(open(A+f))['hooks'])
-    json.dump(d,open(s,'w'),indent=2); print('merged',s)
-shutil.copy(A+'codex_hooks_snippet.json','/home/ahmed/.codex/hooks.json')
-print('wrote ~/.codex/hooks.json')"
+python3 - <<'EOF'
+import json, os, shutil
+
+A = os.getcwd()
+H = os.path.expanduser('~')
+
+def hooks(name):
+    text = open(os.path.join(A, name)).read().replace('__AGENTBUS_DIR__', A)
+    return json.loads(text)['hooks']
+
+for s, f in ((H + '/.claude/settings.json', 'claude_hooks_snippet.json'),
+             (H + '/.gemini/settings.json', 'gemini_hooks_snippet.json')):
+    d = json.load(open(s))
+    shutil.copy(s, s + '.bak-agentbus')
+    d.setdefault('hooks', {}).update(hooks(f))
+    json.dump(d, open(s, 'w'), indent=2)
+    print('merged', s)
+
+codex = H + '/.codex/hooks.json'
+json.dump({'hooks': hooks('codex_hooks_snippet.json')}, open(codex, 'w'), indent=2)
+print('wrote', codex)
+EOF
 ```
 
 Optional, in `~/.bashrc`:
 
 ```bash
-source /home/ahmed/source_code/agentbus/shell.sh
+source /path/to/agentbus/shell.sh
 ```
 
 That shadows `claude`, `codex` and `gemini` with same-named functions, so a

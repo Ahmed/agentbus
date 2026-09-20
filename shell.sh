@@ -2,7 +2,7 @@
 # them.
 #
 # Source this from ~/.bashrc:
-#     source /home/ahmed/source_code/agentbus/shell.sh
+#     source /path/to/agentbus/shell.sh
 #
 # You still type `claude`, `codex`, `gemini`. Each is shadowed by a shell
 # function of the same name that adds one thing: an opening prompt telling
@@ -15,8 +15,10 @@
 # through, so scripts and one-shot commands behave exactly as before.
 # Shell functions are not exported, so non-interactive shells are unaffected.
 
-AGENTBUS_DIR=/home/ahmed/source_code/agentbus
-AGENTBUS_PYTHON=/home/ahmed/.gemini-mcp-venv/bin/python
+# Where this file lives, so the briefing quotes a path that works on any
+# machine. Override AGENTBUS_PYTHON if python3 is not on PATH.
+AGENTBUS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENTBUS_PYTHON="${AGENTBUS_PYTHON:-python3}"
 
 # One briefing for all three, with the mailbox name substituted, so no agent
 # ends up with a different idea of how the bus works.
@@ -27,7 +29,7 @@ reach you through /tmp/agentbus/bus.jsonl, one JSON message per line.
 
   Let BUS mean:
 
-  /home/ahmed/.gemini-mcp-venv/bin/python /home/ahmed/source_code/agentbus/bus.py
+  $AGENTBUS_PYTHON $AGENTBUS_DIR/bus.py
 
   Read your new messages — each read advances your own position, so you see
   each message once and other sessions still get their own copy:
