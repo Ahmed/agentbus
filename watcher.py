@@ -1,62 +1,38 @@
 #!/usr/bin/env python3
-"""Rings the terminal of a window that has mail and is not looking.
+"""Observe unread mail without consuming it; notifications are opt-in.
 
-The hooks deliver mail only at moments the CLI chooses to fire one: a
-tool call, the start of a turn, the end of a turn. A window sitting at an
-empty prompt fires none of them, so its mail waits for the operator to
-type something -- and the operator has no way of knowing there is
-anything to type for. This process closes that last gap, and closes it
-the only way that is actually available.
+Hooks deliver mail only when the CLI runs a tool or reaches a turn
+boundary. A window at an empty prompt has no active hook, so this watcher
+cannot deliver mail into its conversation or start a turn.
 
-What it does NOT do, because nothing on this machine can: put the message
-into the conversation. There is no supported channel from outside a CLI
-into a running turn. Keystroke injection through the tty is off
-(`dev.tty.legacy_tiocsti = 0` on this kernel and most others since 6.2),
-writing to the window's stdout paints characters over a TUI that is busy
-redrawing, and the hook interface is a reply to something the CLI asked,
-not a door to knock on. `tmux send-keys` is the one real exception and it
-requires every CLI to be launched inside tmux, which they are not.
+The watcher is silent by default. --notify enables desktop notifications
+and --bell enables the terminal bell; each must be requested explicitly.
+--no-notify overrides --notify for compatibility with older invocations.
 
-So this rings a bell and raises a desktop notification, and the operator
-presses Enter. That is a smaller promise than push delivery and it is an
-honest one.
+Never consume. bus.peek scans without moving the cursor or settling
+mail, leaving delivery to the window's hook.
 
-Two rules it must not break:
-
-Never consume. It looks with bus.peek, which scans without moving the
-cursor and without settling delivery, so the mail it rings about is still
-there for the window's own hook to deliver. A watcher that read the
-message would be a watcher that stole it.
-
-Never touch presence. Calling bus.touch here would refresh the
-heartbeat of a window that is doing nothing, so the roster would show
-every watched window as permanently online and `_live_addressees` would
-count it as an addressee that can never read. Presence must keep meaning
-"a hook fired recently".
+Never touch presence. A watcher must not make an idle window look active.
 
 Started by session_hook.py at SessionStart, one per window, deduplicated
 by an exclusive lock on a file named for the session. It exits when the
-CLI process it was started for goes away, so closing a window takes its
-watcher with it.
+CLI process it was started for goes away.
 """
 
 import argparse
 import fcntl
-import json
 import os
 import shutil
 import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bus
-
 
 # How often to look. The cost of a look is a stat of one file and, only
 # when that file has changed, a scan of the tail of it -- so this is
 # closer to free than the interval suggests. Kept well under the ten
-# minute TTL so nothing expires unannounced.
+# minute TTL so enabled notifications can arrive before expiry.
 POLL_SECONDS = 2.0
 
 # How long a message must sit unread before it is worth ringing about.
@@ -77,6 +53,11 @@ BELL = b"\a"
 # land in the middle of the window's display.
 LOG_ENV = "AGENTBUS_WATCHER_LOG"
 
+# How long to wait for the notifier before giving up on it. Generous for
+# something that normally returns in milliseconds, and short enough that
+# a broken session bus costs one poll rather than the whole watcher.
+NOTIFY_TIMEOUT_SECONDS = 5.0
+
 
 def _tty_of(pid):
     """The terminal a process is reading from, if it has one.
@@ -90,7 +71,7 @@ def _tty_of(pid):
         what a CLI launched from an IDE or run headless looks like.
     """
     try:
-        target = os.readlink("/proc/%d/fd/0" % pid)
+        target = os.readlink(f"/proc/{pid}/fd/0")
     except (IOError, OSError):
         return None
     if target.startswith("/dev/pts/") or target.startswith("/dev/tty"):
@@ -110,27 +91,30 @@ def _alive(pid):
 def _claim(state, agent, session):
     """Take the one-watcher-per-window lock, or report it is taken.
 
-    The lock is held for the life of the process by leaving the file
-    open; it is released by exiting, including by being killed, which
-    matters because nothing here gets a clean shutdown. A session that
-    starts, is resumed, and is cleared fires SessionStart three times and
-    must not end up with three watchers ringing in unison.
+    The lock is held for the life of the process by leaving the
+    descriptor open; it is released by exiting, including by being
+    killed, which matters because nothing here gets a clean shutdown. A
+    session that starts, is resumed, and is cleared fires SessionStart
+    three times and must not end up with three watchers ringing in
+    unison.
+
+    A raw descriptor rather than a file object on purpose: a file object
+    hands the lock back if it is ever garbage collected, and an integer
+    cannot be.
 
     Returns:
-        The open file keeping the lock, or None if another watcher holds
-        it. The caller must keep the returned object alive.
+        The open descriptor holding the lock, or None if another watcher
+        has it.
     """
-    path = os.path.join(state, "watch.%s.%s.lock" % (agent, session))
-    guard = open(path, "a")
+    path = os.path.join(state, f"watch.{agent}.{session}.lock")
+    guard = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
     try:
         fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (IOError, OSError):
-        guard.close()
+        os.close(guard)
         return None
-    guard.seek(0)
-    guard.truncate()
-    guard.write(str(os.getpid()))
-    guard.flush()
+    os.ftruncate(guard, 0)
+    os.write(guard, str(os.getpid()).encode("ascii"))
     return guard
 
 
@@ -142,9 +126,9 @@ def _describe(messages):
     text = " ".join((first.get("text") or "").split())
     if len(text) > 90:
         text = text[:89] + "…"
-    line = "%s from %s: %s" % (kind, sender, text)
+    line = f"{kind} from {sender}: {text}"
     if len(messages) > 1:
-        line += "\n(+%d more waiting)" % (len(messages) - 1)
+        line += f"\n(+{len(messages) - 1} more waiting)"
     return line
 
 
@@ -165,16 +149,25 @@ def _notify(handle_name, messages, notifier):
     Best effort throughout: a machine with no notification daemon, or a
     session with no bus address to reach one, is not a reason for this to
     die and stop ringing bells it can still ring.
+
+    Waited for, under a timeout, rather than left to run: notify-send
+    hands the notification to the daemon and returns in milliseconds, and
+    a watcher that never reaps it accumulates a zombie per bell for as
+    long as the window is open. The timeout is there because a broken
+    session bus is the one case where it would not return at all, and a
+    stuck notifier must not cost the bell it was raised for.
     """
     if not notifier:
         return
-    title = "agentbus: %d for %s" % (len(messages), handle_name)
+    title = f"agentbus: {len(messages)} for {handle_name}"
     try:
-        subprocess.Popen([notifier, "-a", "agentbus", "-u", "normal",
-                          title, _describe(messages)],
-                         stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
-    except (IOError, OSError):
+        subprocess.run([notifier, "-a", "agentbus", "-u", "normal",
+                        title, _describe(messages)],
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL,
+                       timeout=NOTIFY_TIMEOUT_SECONDS,
+                       check=False)
+    except (IOError, OSError, subprocess.TimeoutExpired):
         pass
 
 
@@ -189,13 +182,51 @@ def _log(message):
     if not path:
         return
     try:
-        with open(path, "a") as handle:
-            handle.write("%.0f %d %s\n" % (time.time(), os.getpid(), message))
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"{time.time():.0f} {os.getpid()} {message}\n")
     except (IOError, OSError):
         pass
 
 
+def _ripe(waiting, first_seen, announced, now):
+    """The mail that has sat unread long enough to be worth a bell.
+
+    Also forgets anything that has left the bus, so the same window can
+    be rung again if that sender writes again later. Both dictionaries
+    are updated in place.
+
+    Returns:
+        The records to ring about, in the order the bus holds them.
+    """
+    present = set()
+    ready = []
+    for record in waiting:
+        key = record.get("id")
+        if not key:
+            continue
+        present.add(key)
+        first_seen.setdefault(key, now)
+        if key in announced:
+            continue
+        if now - first_seen[key] >= GRACE_SECONDS:
+            ready.append(record)
+
+    for key in list(first_seen):
+        if key not in present:
+            first_seen.pop(key, None)
+            announced.discard(key)
+
+    return ready
+
+
 def main():
+    """Observe waiting mail until the window goes away, silently by default.
+
+    Returns:
+        A process exit status. Always 0: every way this ends -- the
+        window closing, another watcher already holding the lock -- is a
+        watcher with nothing left to do rather than a failure.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--agent", required=True,
                         help="the CLI name this window answers to")
@@ -208,25 +239,27 @@ def main():
                              "where its job is derived from")
     parser.add_argument("--pid", type=int, default=0,
                         help="the CLI process to follow; the watcher exits "
-                             "when it does, and rings its tty")
+                             "when it does")
+    parser.add_argument("--notify", action="store_true",
+                        help="enable desktop notifications (off by default)")
+    parser.add_argument("--bell", action="store_true",
+                        help="enable the terminal bell (off by default)")
     parser.add_argument("--no-notify", action="store_true",
-                        help="ring the tty but raise no desktop "
-                             "notification. Exists because testing this "
-                             "without it puts real popups on the owner's "
-                             "screen, which is exactly what happened.")
+                        help="disable desktop notifications, overriding "
+                             "--notify; retained for compatibility")
     options = parser.parse_args()
 
     client = bus.connect(session=options.session, cwd=options.cwd or None)
     guard = _claim(client.state, options.agent, options.session)
     if guard is None:
-        _log("another watcher already holds %s" % options.session)
+        _log(f"another watcher already holds {options.session}")
         return 0
 
     window = options.pid or 0
-    tty = _tty_of(window) if window else None
-    notifier = None if options.no_notify else shutil.which("notify-send")
-    _log("watching %s session=%s tty=%s" % (options.agent, options.session,
-                                            tty))
+    tty = _tty_of(window) if options.bell and window else None
+    notifier = (shutil.which("notify-send")
+                if options.notify and not options.no_notify else None)
+    _log(f"watching {options.agent} session={options.session} tty={tty}")
 
     # Ids already rung for, and when each was first seen waiting. Kept in
     # memory only: a watcher that restarts has no history, and ringing
@@ -237,7 +270,7 @@ def main():
 
     while True:
         if window and not _alive(window):
-            _log("window %d gone" % window)
+            _log(f"window {window} gone")
             return 0
 
         try:
@@ -248,33 +281,16 @@ def main():
             # over; the next look will find whatever is there.
             waiting = []
 
-        now = time.time()
-        present = set()
-        ripe = []
-        for record in waiting:
-            key = record.get("id")
-            if not key:
-                continue
-            present.add(key)
-            first_seen.setdefault(key, now)
-            if key in announced:
-                continue
-            if now - first_seen[key] >= GRACE_SECONDS:
-                ripe.append(record)
-
-        # Forget anything that has left the bus, so the window can be
-        # rung again if the same sender writes again later.
-        for key in list(first_seen):
-            if key not in present:
-                first_seen.pop(key, None)
-                announced.discard(key)
+        ripe = _ripe(waiting, first_seen, announced, time.time())
 
         if ripe:
             handle_name = bus.current_handle(client, options.agent)
-            _ring(tty)
-            _notify(handle_name, ripe, notifier)
+            if options.bell:
+                _ring(tty)
+            if notifier:
+                _notify(handle_name, ripe, notifier)
             announced.update(record["id"] for record in ripe)
-            _log("rang for %s" % ",".join(r["id"] for r in ripe))
+            _log("observed unread " + ",".join(r["id"] for r in ripe))
 
         time.sleep(POLL_SECONDS)
 

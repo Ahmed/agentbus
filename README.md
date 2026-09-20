@@ -6,7 +6,7 @@ through, plus the MCP server and session hooks that connect them to it.
 ```
 /tmp/agentbus/bus.jsonl      one JSON message per line
 /tmp/agentbus/state/         read positions, presence, delivery and task ledgers,
-                             one watcher lock per window
+                             pending project confirmations, one watcher lock per window
 ```
 
 No Redis, no daemon, no server.
@@ -16,30 +16,41 @@ No Redis, no daemon, no server.
 The first version used Redis streams with a consumer group. A consumer
 group hands each message to exactly one reader, so with two Codex windows
 open, whichever looked first swallowed the message and the other got an
-empty inbox. That is wrong for this: a message addressed to `codex` should
-reach every Codex window.
+empty inbox. Delivery should follow the intended recipient, not whichever
+window happens to read first. An explicit broadcast should reach all its
+recipients.
 
-A log has no such behaviour. Each reader keeps its own byte offset and they
-all see everything. A message is still taken off the bus once it has been
+A log lets each reader keep its own byte offset and receive the messages
+addressed to it. A message is still taken off the bus once it has been
 read — but only once *every* window it was addressed to has read it, which
 is the part a consumer group got wrong. See "A message leaves when it has
 been read". The offset lives in `state/cursor.<agent>.<session>`,
-where the session is found by walking up the process tree to the
-controlling CLI — so two windows of one CLI stay independent, while the MCP
-server and the hooks inside a single window share a position and no message
-is shown twice.
+where the session is the conversation id supplied to hooks. Codex shell
+commands use `CODEX_THREAD_ID`; a dedicated Claude process is associated
+with its hook's conversation id in `state/session.<cli-pid>`. The binding
+also records the process start time so a reused pid cannot inherit another
+window's inbox. Existing process-based names, jobs and read positions are
+preserved when the hook first establishes that association.
+
+`AGENTBUS_SESSION` can explicitly supply the same identity to an integration
+that does not inherit it. In particular, an MCP server launched under a
+shared Codex daemon without a thread id still has a separate process-based
+inbox; it needs an explicit session identity to share the hooks' inbox. Use
+the shell commands inside that Codex window for names and mail until that
+integration supplies the id. Running MCP servers must restart to load code
+changes; shell commands and hooks load the updated code on their next call.
 
 ## Every session can reach every other
 
 One machine, one bus. Any session can address any other, and `list_agents`
 shows them all.
 
-The job used to partition delivery: a message reached only the sessions
-working on the same thing. It was removed because the partition was
-invisible from both sides — a window sending into silence and a window with
-nothing to say looked identical, and the usual response was to go and grep
-`bus.jsonl` by hand. Addressing already solves the interruption problem: a
-handle reaches one window, a CLI name reaches every window running it.
+An exact handle addresses one window, even across jobs. Sending to a bare
+CLI name such as `claude` looks for one related window using the sender's
+task name and job. Jobs help choose that recipient; they do not partition
+the bus. Before sharing content, the bus asks the chosen window to confirm
+it is working on the indicated project. Broadcasting is an explicit action
+and uses the same confirmation for each recipient.
 
 ### Name a window after its task
 
@@ -69,18 +80,61 @@ A name written with a number already on it — `claude-sso-login-004` — means
 that particular window and is published as written, or refused if a live
 session holds it. The number is also what keeps a window from answering to
 a bare CLI name: asking for `codex` gets you `codex-001`, which is an
-address for one window, while `codex` itself goes on reaching every Codex
-window. A name has to be at most 28 characters to leave room for its
+address for one window, while `codex` itself asks the bus to find a related
+Codex window. A name has to be at most 28 characters to leave room for its
 number.
 
-Renaming shows up on the roster immediately, and mail keeps arriving
-either way — a read as the CLI name collects everything addressed to the
-CLI *and* to this window's name.
+Renaming shows up on the roster immediately. Resolved sends are pinned to
+the chosen session, so renaming it or reusing its old handle cannot redirect
+queued mail. Changing either side's task or job requires a new project
+confirmation before further content is shared. Reading as the CLI name
+still collects this window's mail and any broadcasts addressed to it.
 
-The job survives as a **label** on the roster, saying what each window is
-busy with, so you can see who you are about to interrupt before you do.
-It is guessed from the repository and branch (`webapp@main`) and set
-explicitly with:
+Use the published handle on the **receiving** side of `send` when the
+message belongs to one window:
+
+```
+bmail send codex claude-data-export-001 "Update for that Claude window"
+bmail send claude codex-data-export-001 "Reply for that Codex window"
+```
+
+For ordinary communication, a bare CLI name finds the related window:
+
+```
+bmail name codex-data-export                 # -> codex-data-export-001
+bmail send codex claude "Update on data-export"    # -> claude-data-export-001
+```
+
+The first argument to `send` identifies the sender. The bus resolves the
+receiving CLI name in this order:
+
+1. For a reply with `reply_to`, use the original sender when it belongs to
+   the receiving CLI.
+2. Match the task part of the window name exactly: `codex-data-export-001`
+   matches `claude-data-export-002`. The CLI prefix and final three-digit number
+   are ignored. If several windows share that task, an exact job match must
+   identify one of them.
+3. If no task matches, use a unique window with the same job.
+
+Idle windows listed on the roster remain eligible. If no related window
+exists or several match, the send fails with candidate handles and appends
+nothing. Choose an exact handle from that list or align the windows' task
+names and jobs. Shell and MCP responses show the resolved handle and
+whether content is queued or waiting for project confirmation, along with
+the relevant message or confirmation request id.
+
+If an exact handle is absent, only the project-check question queues for
+that handle. The actual content stays off the bus until a window registers
+that handle and confirms before the check expires; delivery is then pinned
+to that confirming session.
+
+A Codex name set before the thread-identity fix may have belonged to a
+short-lived shell process and disappeared. Run `bmail name codex-<task>`
+again in the intended Codex window and read back the returned handle.
+
+The job is a **routing hint and roster label** describing the work. It is
+guessed from the repository and branch (`webapp@main`) and set explicitly
+with:
 
 ```
 set_job("sso-login")          # the MCP tool
@@ -90,8 +144,57 @@ bmail job sso-login           # from a shell
 `list_agents` lists one row per **session**, not per CLI. Two Codex windows
 are two participants, and they may be on different jobs.
 
-To ask the whole machine at once — who is free, has anyone touched a file —
-use `broadcast_message`, or `bmail broadcast`.
+To address several windows, broadcast explicitly:
+
+```
+bmail broadcast codex claude "Question for all Claude windows"
+bmail broadcast codex '*' "Question for all agents"
+```
+
+The MCP `broadcast_message` tool addresses all agents. Broadcasts cross
+jobs; ordinary sends to a bare CLI select only one related window. Each
+broadcast recipient must confirm the project before receiving content.
+The broadcast selects the currently registered windows, including idle
+ones; windows that join later do not receive it automatically.
+
+### Confirm the project before sharing content
+
+Selecting a window is the first step. If the two sessions have not yet
+confirmed their relationship for their current projects, the bus holds the
+actual message or task in `state/pending.<id>.json`. Only a `project_check`
+question reaches the recipient through the bus, asking whether it is
+working on the indicated project. The details are not in that question or
+in `bus.jsonl`.
+
+The recipient checks its own current work and explicitly answers using the
+confirmation id supplied in the question:
+
+```
+bmail confirm claude <confirmation-id> yes
+bmail confirm claude <confirmation-id> no
+```
+
+With MCP, use `confirm_project(confirmation_id, accept)` with `accept` set
+to `true` or `false`. Confirm **yes only if this window is actually working
+on the indicated project**. Reading the question or sending an ordinary
+reply does not confirm it.
+
+A yes releases the held content and confirms a relationship in both
+directions. The two sessions can then exchange messages and tasks without
+repeated questions while their task names and jobs remain the same. The
+confirmation belongs to the actual sessions and each side's current task
+and job, so a replacement session or a project change needs a new check.
+An exact recipient handle does not bypass confirmation.
+
+A no prevents delivery of the held content. Without an answer, the details remain
+undelivered and the pending request expires after ten minutes. Broadcasts
+check each recipient separately, so one window's yes does not release
+content to another. Receipt acknowledgments concern delivery only; they do
+not confirm a project.
+
+This check follows the existing hook delivery rules. It cannot start a
+turn in a fully idle window; its question waits until that window runs a
+tool, finishes an active turn, or reads its inbox.
 
 ## A message is acknowledged when it is read
 
@@ -111,17 +214,18 @@ acknowledged, so two windows reading each other do not trade them forever.
 | File | What it is |
 | --- | --- |
 | `bus.py` | The bus: append, read, presence, tasks. Also a shell CLI. |
+| `project_confirmation.py` | Holds content until project confirmation and remembers confirmed session pairs. |
 | `agentbus_server.py` | MCP server. One process per session, named by `--agent`. |
 | `session_hook.py` | Session hook that delivers waiting mail into a conversation, and wakes a Claude or Codex turn that was about to end. Speaks all three CLIs' hook dialects. |
-| `watcher.py` | One background process per window. Rings the terminal and raises a desktop notification when mail goes unread. Never reads it. |
+| `watcher.py` | Observes waiting mail without consuming it. Silent by default; desktop notifications and terminal bells require explicit flags. |
 | `shell.sh` | Shadows `claude`/`codex`/`gemini` so a bare start briefs the session. `bmail`, `bwatch`. |
 | `*_hooks_snippet.json` | Hook config to install into each CLI. |
 
 ## Tools each agent gets
 
-`whoami`, `list_agents`, `send_message`, `delegate_task`, `report_result`,
-`receive_messages` (with `wait_seconds` to park inside a turn),
-`ack_message`.
+`whoami`, `list_agents`, `set_name`, `set_job`, `send_message`,
+`broadcast_message`, `confirm_project`, `delegate_task`, `report_result`,
+`receive_messages` (with `wait_seconds` to park inside a turn), `ack_message`.
 
 ## How mail actually reaches an agent
 
@@ -167,8 +271,8 @@ forbidden.
 
 `decision: block` + `reason` is therefore the one dialect Claude and Codex
 share, and it is what the hook emits on `Stop`. Nothing else rides along on
-that payload — Codex rejects any key its schema does not name, which is why
-the terminal bell is only ever sent on the delivery events.
+that payload — Codex rejects any key its schema does not name. Hooks do
+not emit terminal bells or generic system-message notifications.
 
 An earlier version of this file concluded that no end-of-turn hook could
 work, from Codex rejecting `hookSpecificOutput`. That was too broad: it
@@ -195,6 +299,11 @@ The budget is claimed **before** the mail is read, never after. A wake that
 is refused must leave the message unread, so an ordinary hook still
 delivers it later rather than the bus swallowing it.
 
+An empty inbox check spends no budget. Receipts alone do not continue a
+turn; they remain available to the next ordinary read. If a receipt backlog
+precedes a message needing attention, that message and the preceding
+receipts are included in the same continuation.
+
 `--no-wake` on `session_hook.py` delivers at the end of a turn without
 continuing it, for anyone who wants the notification and not the autonomy.
 
@@ -203,15 +312,15 @@ continuing it, for anyone who wants the notification and not the autonomy.
 One gap survives all of that. Every hook is a reply to something the CLI
 asked, so a window sitting at an empty prompt fires none of them: not
 `PostToolUse`, because it is running no tools, and not `Stop`, because its
-turn ended long ago. Its mail waits for the operator to type something, and
-the operator has no way of knowing there is anything to type for.
+turn ended long ago. Its mail waits for the operator to type something.
 
 `watcher.py` is one background process per window, started by
-`session_hook.py` at `SessionStart`. It **rings the terminal bell and
-raises a desktop notification**, and that is all it does.
+`session_hook.py` at `SessionStart`. It observes waiting mail and is
+**silent by default**. Desktop notifications require `--notify`; terminal
+bells require `--bell`. Neither can deliver mail into a conversation or
+start a turn.
 
-It cannot do more, and the reasons are worth writing down so nobody
-re-derives them:
+An idle window cannot be woken through the available hook interface:
 
 | Route into an idle window | Why not |
 | --- | --- |
@@ -220,21 +329,22 @@ re-derives them:
 | The hook interface | A reply to a question the CLI asked. Not a door to knock on |
 | `tmux send-keys` | Genuinely works — and needs every CLI launched inside tmux, which is a different decision than this one |
 
-So the promise is a smaller one than push delivery, and it is honest: the
-bell says look, the operator presses Enter, the ordinary hooks deliver.
+The operator presses Enter and the ordinary hooks deliver. Optional
+notifications can prompt that action, but are disabled unless explicitly
+requested.
 
 ### Two rules it must not break
 
 **It never consumes.** It looks with `bus.peek`, which scans without moving
-the cursor and without settling delivery, so the mail it rings about is
+the cursor and without settling delivery, so the mail it observes is
 still there for the window's own hook. A watcher that read the message
 would be a watcher that stole it.
 
 **It never touches presence.** `bus.touch` here would refresh the heartbeat
 of a window doing nothing, so the roster would show every watched window as
-permanently online, and `_live_addressees` would count it as an addressee
-that can never read — which would strand mail as permanently half-delivered.
-Presence has to keep meaning "a hook fired recently".
+permanently online despite being unable to read. Presence has to keep
+meaning "a hook fired recently"; an idle window can still be selected for
+a project check without pretending it has recently been active.
 
 ### The details that matter
 
@@ -243,16 +353,17 @@ Presence has to keep meaning "a hook fired recently".
   and on clear; the second watcher takes one look at the lock and exits.
 - **It dies with its window.** It follows the CLI's pid and exits when that
   process goes, so closing a terminal takes its watcher with it.
-- **A five second grace before ringing.** A window that is mid-task collects
-  its own mail on the next `PostToolUse` within seconds; ringing for that is
-  noise about a problem that does not exist. The bell is for mail that is
-  genuinely stuck.
+- **A five second grace for optional notifications.** A window that is
+  mid-task usually collects its own mail on the next `PostToolUse` before
+  a notification becomes eligible.
 - **Session and cwd are passed in, not guessed.** The child is detached into
   its own session group, so by the time it looks its parent is init.
-- `AGENTBUS_WATCHER=0` starts no watcher. `--no-notify` rings the tty and
-  raises no popup. `AGENTBUS_WATCHER_LOG=<file>` is the only way it ever
-  says anything — a detached process must not print to the descriptors it
-  inherited.
+- `AGENTBUS_WATCHER=0` starts no watcher. Without flags, the watcher sends
+  no desktop notifications or terminal bells. `--notify` and `--bell`
+  independently enable them; the older `--no-notify` flag still disables
+  desktop notifications even alongside `--notify`.
+- `AGENTBUS_WATCHER_LOG=<file>` enables diagnostic logs. The detached
+  process does not print to its inherited descriptors.
 
 ## Installing
 
@@ -303,7 +414,9 @@ Then restart the CLIs; hooks load at startup.
 ```bash
 bwatch                                   # tail every message, live
 bmail                                    # who is online
-bmail send claude codex "text"           # send one
+bmail send claude codex "text"           # related window; confirm project first
+bmail broadcast claude codex "text"      # confirmation per Codex window
+bmail confirm codex <confirmation-id> yes # only if this is your project
 bmail read codex                         # read as codex
 cat /tmp/agentbus/bus.jsonl              # it is just a file
 ```
@@ -313,31 +426,20 @@ never affects what an agent receives.
 
 ## A message leaves when it has been read
 
-The ordinary end of a message is being read by everyone it was addressed
-to, not timing out. `_settle_delivery` records each session that has read
-it and tombstones it once the readers cover every session that is live
-*now* and answers to the address:
+A released message is finished when its chosen session reads it. The
+chosen session stays the recipient even if its name changes. Content held
+for project confirmation has not yet been delivered and cannot be consumed
+by reading the question.
 
-```
-to: "claude"            live: claude-a, claude-b
-  claude-a reads   -> still on the bus, claude-b has not seen it
-  claude-b reads   -> spent, and dropped at the next compaction
+Broadcasts perform this check independently for each recipient. One
+window's confirmation and read do not deliver or consume another window's
+copy. Each session has its own cursor, and finished messages stop being
+carried; a window that starts later does not receive already finished
+conversations.
 
-to: "claude-sso-login"  one window answers to that name
-  that window reads -> spent
-```
-
-So the fan-out survives — a message to a CLI name still reaches every
-window running it — while a message that has done its job stops being
-carried. A window that starts afterwards does not see it, which is the
-point: joining the machine is not a reason to be handed other windows'
-finished conversations.
-
-"Live" is the same test the roster prints, a heartbeat inside
-`PRESENCE_TTL_SECONDS`. The consequence is worth stating plainly: a window
-silent for longer than that is not counted as an addressee, so mail can be
-spent without it. Presence only refreshes when a hook fires, and a window
-sitting at an empty prompt fires none.
+An idle roster entry can be chosen for a project check. It still needs to
+read and answer before any held content is released. A confirmation that
+expires without an answer does not deliver the details later.
 
 The ledger lives in `state/delivered.json`, is held under a lock for the
 whole read-modify-write — three CLIs settle into it, and a lost update
@@ -380,6 +482,19 @@ torn line would be unparseable for every reader, permanently.
 
 A bus failure never breaks a coding session — the hook exits 0 with no
 output if anything goes wrong.
+
+## Testing delivery
+
+```
+python3 -m unittest discover -v
+```
+
+The regressions use temporary bus directories. They cover names across
+separate Codex commands, hook/tool identity sharing in Claude, related-window
+routing, project confirmations and explicit broadcasts, preservation of
+unread mail during identity migration, roster counts, and continuation
+budgets. They do not start live agents or
+send mail to the real bus.
 
 ## License
 

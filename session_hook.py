@@ -43,10 +43,10 @@ rather than assumed:
 There is still one window this cannot reach: the one sitting at an empty
 prompt, which fires no hook of any kind and so is never asked anything.
 Nothing can put a message into that conversation from outside -- see
-watcher.py for why the obvious routes are all closed -- so SessionStart
-starts a watcher behind each window instead, which rings the terminal and
-raises a desktop notification when mail goes unread. The operator presses
-Enter and the ordinary hooks take it from there.
+watcher.py for why the obvious routes are all closed. SessionStart starts
+an observer behind each window, but it is silent by default. Desktop
+notifications and terminal bells require explicit watcher flags. The
+operator presses Enter and the ordinary hooks take it from there.
 
 Nothing here is allowed to break the session it is attached to. A missing
 bus, a malformed payload or an unknown event all exit 0 with no output,
@@ -60,19 +60,11 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bus
-
 
 # Hooks fire on every turn, so they take a small bite. A flood of mail
 # drains over several turns instead of burying one prompt.
 HOOK_MESSAGE_LIMIT = 5
-
-# Asks the terminal for a bell and an urgency hint, so an unattended
-# session still visibly signals that another agent said something. Only
-# ever sent on the delivery events: the Stop payload is schema-checked by
-# Codex and an unknown key there is rejected outright.
-BELL_SEQUENCE = "\a"
 
 # Claude and Gemini name the same moments differently, so one script can
 # be wired into either CLI unchanged: SessionStart is shared, BeforeAgent
@@ -96,7 +88,8 @@ TURN_START_EVENTS = ("UserPromptSubmit", "BeforeAgent")
 # is all the Stop events flowing from a single operator prompt; the CLI
 # reports it through prompt_id (Claude) or turn_id (Codex), and marks the
 # second and later ones with stop_hook_active.
-MAX_CHAIN_CONTINUATIONS = int(os.environ.get("AGENTBUS_MAX_CONTINUATIONS", "3"))
+MAX_CHAIN_CONTINUATIONS = int(
+    os.environ.get("AGENTBUS_MAX_CONTINUATIONS", "3"))
 
 # A second, coarser bound. Two windows that answer each other start a new
 # chain every time, so the per-chain cap alone does not stop a pair of
@@ -110,26 +103,32 @@ MAX_WAKES_PER_WINDOW = int(os.environ.get("AGENTBUS_MAX_WAKES", "10"))
 WATCHER_ENV = "AGENTBUS_WATCHER"
 
 
-def _start_watcher(client, agent, payload):
-    """Put a bell-ringer behind this window, if one is not there already.
+def _start_watcher(client, agent):
+    """Start a silent mail observer for this window if none is running.
 
     Spawned detached and never waited on: the CLI blocks on this hook, so
     anything that took time here would be felt as the session being slow
     to start. It is deduplicated by a lock the watcher takes itself, so
     firing SessionStart again -- on resume, on clear -- costs one process
-    that exits immediately rather than a second bell.
+    that exits immediately rather than a second observer.
 
     The session and cwd are passed explicitly because the child is put in
     its own session group: by the time it looks, its parent is init and
     walking the process tree would find nothing. The CLI's pid goes with
-    them, as the thing it follows and the tty it rings.
+    them so the observer exits when the window closes.
+
+    Returns:
+        The detached watcher, or None when none was started -- switched
+        off, script missing, or refused by the OS. Handed back rather
+        than dropped so a caller can tell those apart; it is deliberately
+        never waited on.
     """
     if os.environ.get(WATCHER_ENV) == "0":
-        return
+        return None
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "watcher.py")
     if not os.path.exists(script):
-        return
+        return None
     command = [sys.executable, script,
                "--agent", agent,
                "--session", client.session,
@@ -139,17 +138,18 @@ def _start_watcher(client, agent, payload):
         command += ["--pid", str(window)]
     try:
         with open(os.devnull, "r+b") as null:
-            subprocess.Popen(command, stdin=null, stdout=null, stderr=null,
-                             start_new_session=True, close_fds=True)
+            return subprocess.Popen(command, stdin=null, stdout=null,
+                                    stderr=null, start_new_session=True,
+                                    close_fds=True)
     except (IOError, OSError):
-        # A watcher that will not start is a lost bell, not a broken
+        # A watcher that will not start must not break the attached
         # session. The hooks still deliver exactly as they did before.
-        pass
+        return None
 
 
 def _wake_path(client):
     """Where this session's wake budget is kept."""
-    return os.path.join(client.state, "wake.%s" % client.session)
+    return os.path.join(client.state, f"wake.{client.session}")
 
 
 def _chain_key(payload):
@@ -165,16 +165,23 @@ def _chain_key(payload):
 
 
 def _read_wake(path):
+    """The budget this session has spent so far, or nothing known yet."""
     try:
-        with open(path) as handle:
+        with open(path, encoding="utf-8") as handle:
             return json.load(handle)
     except (IOError, OSError, ValueError):
         return {}
 
 
 def _write_wake(path, record):
-    temporary = "%s.%d.tmp" % (path, os.getpid())
-    with open(temporary, "w") as handle:
+    """Record the spent budget, atomically.
+
+    Written beside the target and renamed over it, because two hooks of
+    one window can fire close enough together to catch a half-written
+    file, and a truncated budget reads as no budget at all.
+    """
+    temporary = f"{path}.{os.getpid()}.tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
         json.dump(record, handle)
     os.replace(temporary, path)
 
@@ -216,13 +223,10 @@ def _claim_wake(client, payload):
     return True
 
 
-def _emit(event, context, bell=False):
+def _emit(event, context):
     """Deliver mail into a turn that is going to carry on anyway."""
     payload = {"hookSpecificOutput": {"hookEventName": event,
-                                      "additionalContext": context},
-               "systemMessage": "Agent bus: new message"}
-    if bell:
-        payload["terminalSequence"] = BELL_SEQUENCE
+                                      "additionalContext": context}}
     json.dump(payload, sys.stdout)
     sys.stdout.write("\n")
 
@@ -234,8 +238,7 @@ def _emit_continue(context):
     both accept on Stop, and Codex rejects any key its schema does not
     name -- so this payload carries nothing else.
     """
-    payload = {"decision": "block", "reason": context,
-               "systemMessage": "Agent bus: new message, continuing the turn"}
+    payload = {"decision": "block", "reason": context}
     json.dump(payload, sys.stdout)
     sys.stdout.write("\n")
 
@@ -258,8 +261,8 @@ def _preamble(agent, messages, woken=False):
     the operator gets.
     """
     tasks = [m for m in messages if m.get("kind") == "task"]
-    lines = ["Agent bus: %d new message(s) for %r from other agents on this "
-             "machine." % (len(messages), agent)]
+    lines = [f"Agent bus: {len(messages)} new message(s) for {agent!r} "
+             "from other agents on this machine."]
 
     if woken:
         lines.append(
@@ -297,6 +300,13 @@ def _preamble(agent, messages, woken=False):
                 "or outside the job, and report that refusal instead of "
                 "going quiet.")
 
+    if any(message.get("kind") == "project_check" for message in messages):
+        lines.append(
+            "A [project_check] is only a question about what this window is "
+            "working on. Confirm yes only if its named project matches your "
+            "current work; otherwise confirm no. Use confirm_project or the "
+            "bus.py confirm command in the check. A receipt is not confirmation. "
+            "The task details remain withheld until you explicitly confirm.")
     lines.append("")
     lines.append(bus.format_messages(messages))
     return "\n".join(lines)
@@ -332,6 +342,7 @@ def main():
     # single reader and they steal each other's mail.
     client = bus.connect(session=payload.get("session_id"),
                          cwd=payload.get("cwd"))
+    bus.bind_session(client, options.agent)
 
     waking = event in CONTINUE_EVENTS and not options.no_wake
     busy = TURN_START_EVENTS + PER_TOOL_EVENTS
@@ -341,19 +352,31 @@ def main():
                  session=payload.get("session_id"))
 
     if event == "SessionStart":
-        _start_watcher(client, options.agent, payload)
+        _start_watcher(client, options.agent)
 
     if event in TURN_START_EVENTS:
         # Somebody is at the keyboard, so the runaway budgets start over.
         _reset_wake(client)
 
-    # Claim before reading. A wake that is refused must not swallow the
-    # mail it was refused for.
-    if waking and not _claim_wake(client, payload):
-        return 0
+    # A peek does not consume anything. Empty checks and receipts must not
+    # spend the budget intended for work, or an actual message later in
+    # the same chain can be stranded despite no useful continuations.
+    limit = HOOK_MESSAGE_LIMIT
+    if waking:
+        waiting = bus.peek(client, options.agent)
+        first_action = next((index for index, message in enumerate(waiting)
+                             if message.get("kind") != "ack"), None)
+        if first_action is None:
+            return 0
+        # Include preceding receipts so a receipt backlog cannot hide the
+        # message that justified this wake. They remain visible to the model.
+        limit = max(limit, first_action + 1)
+        # Claim before reading. A refused wake must leave the mail unread.
+        if not _claim_wake(client, payload):
+            return 0
 
     messages = bus.receive_and_settle(client, options.agent,
-                                      limit=HOOK_MESSAGE_LIMIT,
+                                      limit=limit,
                                       fresh_only=True)
     if not messages:
         return 0
@@ -364,14 +387,19 @@ def main():
         bus.touch(client, options.agent, status="busy")
         _emit_continue(_preamble(options.agent, messages, woken=True))
     else:
-        _emit(event, _preamble(options.agent, messages),
-              bell=event in CONTINUE_EVENTS)
+        _emit(event, _preamble(options.agent, messages))
     return 0
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception:
-        # A bus problem must never take the session down with it.
+    except (IOError, OSError, ValueError, TypeError, KeyError,
+            AttributeError, IndexError):
+        # A bus problem must never take the session down with it: every
+        # failure mode of reading the bus, of the state directory, and of
+        # a malformed payload ends as a silent, successful no-op hook.
+        # Deliberately not a bare Exception -- a fault in this file is a
+        # fault worth seeing, and swallowing it would disable delivery
+        # for the window with nothing to show for it.
         sys.exit(0)
