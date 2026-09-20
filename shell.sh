@@ -111,11 +111,25 @@ claude() {
     fi
 }
 
+# Codex is launched attached to its shared app-server daemon, because a
+# thread the daemon holds is one `codex queue` can start a turn in -- and
+# that is the only way mail reaches a codex window that has gone idle.
+# Without this the window still works and still gets mail on its own
+# hooks; it just cannot be woken.
+#
+# Set AGENTBUS_CODEX_REMOTE=0 to launch plain codex instead. The flag is
+# marked experimental upstream, so this is the switch to reach for if it
+# ever misbehaves.
+AGENTBUS_CODEX_REMOTE="${AGENTBUS_CODEX_REMOTE:-unix://}"
+
 codex() {
-    if [ "$#" -eq 0 ]; then
+    if [ "$#" -ne 0 ]; then
+        command codex "$@"
+    elif [ "$AGENTBUS_CODEX_REMOTE" = "0" ]; then
         command codex "$(_agentbus_brief codex)"
     else
-        command codex "$@"
+        command codex --remote "$AGENTBUS_CODEX_REMOTE" \
+            "$(_agentbus_brief codex)"
     fi
 }
 

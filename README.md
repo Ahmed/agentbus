@@ -445,6 +445,28 @@ arguments (`codex exec`, `claude -p`) passes straight through.
 
 Then restart the CLIs; hooks load at startup.
 
+## A send says whether it landed
+
+A send used to return the moment the question was asked, which told the
+sender nothing about whether anybody answered it. That matters more for an
+agent than it would for a person: it has no terminal to watch and no
+reason to look again, so silence reads as success and a message that was
+never delivered looks exactly like one that was.
+
+Now it waits briefly and says:
+
+```
+codex-bus-check-001 -> claude-fbtest-001 (awaiting_confirmation)
+claude-fbtest-001: confirmed, message delivered
+claude-fbtest-001: declined the project, nothing was shared
+claude-fbtest-001: no answer yet, nothing shared so far
+```
+
+Bounded on purpose — a courtesy at the end of a send, not a reason for the
+shell to hang. `AGENTBUS_SEND_WAIT` sets the budget in seconds (default 12,
+`0` to return immediately as before). Whatever is undecided by the deadline
+is reported as undecided.
+
 ## Watching and poking it by hand
 
 ```bash

@@ -232,6 +232,48 @@ class ProjectConfirmationTests(ConfirmationFixture):
         self.assertEqual([item["text"] for item in self.messages(
             self.sender, "codex")], ["reply to sender"])
 
+    def test_pending_state_reports_a_check_still_waiting(self):
+        """A sender can ask what happened without disturbing the check."""
+        request = self.send()
+
+        state = project_confirmation.pending_state(
+            self.sender, request["confirmations"][0]["confirmation_id"])
+
+        self.assertEqual(state["status"], "awaiting_confirmation")
+        self.assertNotIn(self.marker, self.log())
+
+    def test_pending_state_reports_a_yes_and_a_no(self):
+        """The two decisions are distinguishable to the sender."""
+        refused = self.send()
+        self.confirm(refused, accept=False)
+        accepted = self.send()
+        self.confirm(accepted)
+
+        yes = project_confirmation.pending_state(
+            self.sender, accepted["confirmations"][0]["confirmation_id"])
+        no = project_confirmation.pending_state(
+            self.sender, refused["confirmations"][0]["confirmation_id"])
+
+        self.assertEqual(yes["status"], "confirmed")
+        self.assertEqual(no["status"], "rejected")
+
+    def test_pending_state_never_exposes_the_held_text(self):
+        """Asking after a message must not be a way to read it."""
+        request = self.send()
+
+        state = project_confirmation.pending_state(
+            self.sender, request["confirmations"][0]["confirmation_id"])
+
+        self.assertEqual(set(state), {"status", "reason"})
+        self.assertNotIn(self.marker, json.dumps(state))
+
+    def test_pending_state_of_an_unknown_id_is_nothing(self):
+        """A swept or invented id reports nothing rather than raising."""
+        self.assertIsNone(
+            project_confirmation.pending_state(self.sender, "ffffffffffff"))
+        self.assertIsNone(
+            project_confirmation.pending_state(self.sender, "not-an-id"))
+
 
 class ProjectConfirmationContextTests(ConfirmationFixture):
     """What survives an agreement, and what has to be asked again.

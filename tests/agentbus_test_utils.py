@@ -80,7 +80,8 @@ class BusFixture(unittest.TestCase):
         # belongs in a live window, not in a suite where it would add
         # its timeout to every case that ends a turn with no mail.
         environment = mock.patch.dict(
-            os.environ, {"AGENTBUS_JOB": "", "AGENTBUS_STOP_WAIT": "0"})
+            os.environ, {"AGENTBUS_JOB": "", "AGENTBUS_STOP_WAIT": "0",
+                         "AGENTBUS_SEND_WAIT": "0"})
         environment.start()
         self.addCleanup(environment.stop)
 

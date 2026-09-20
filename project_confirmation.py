@@ -83,6 +83,31 @@ def _pending_path(client, confirmation_id):
     return os.path.join(client.state, f"pending.{confirmation_id}.json")
 
 
+def pending_state(client, confirmation_id):
+    """What became of one held request, without disturbing it.
+
+    Read-only and non-consuming, so a sender may ask repeatedly while it
+    waits for an answer. Only the status and the reason are exposed:
+    the held payload is nobody's business but the addressed window's,
+    including the sender's.
+
+    Args:
+        client (Bus): Connection whose private state holds the request.
+        confirmation_id (str): The id to look up.
+
+    Returns:
+        dict or None: {"status", "reason"} for the request, or None when
+            there is no such request -- expired and swept, or never made.
+    """
+    try:
+        record = _load_json(_pending_path(client, confirmation_id))
+    except ValueError:
+        return None
+    if record is None:
+        return None
+    return {"status": record.get("status"), "reason": record.get("reason")}
+
+
 def _context(client, session, agent, handle, job):
     generation = identity.session_generation(session)
     canonical = identity.canonical_session(client, session, generation)

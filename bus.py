@@ -252,7 +252,82 @@ def _send_command(client, argv):
         f'{record.get('status', record['routing'])})'
     ),
         file=sys.stderr)
+    _report_outcome(client, record, SEND_WAIT_SECONDS)
     return 0
+
+
+def _outcome_line(client, check):
+    """One line saying what became of a held message.
+
+    Args:
+        client (Bus): Connection for the calling window.
+        check (dict): A confirmation entry from the send record.
+
+    Returns:
+        str or None: The line to print, or None while it is undecided.
+    """
+    record = project_confirmation.pending_state(
+        client, check["confirmation_id"])
+    if record is None:
+        return f'{check['to']}: no record of that check any more'
+
+    status = record.get("status")
+    if status == "confirmed":
+        return f'{check['to']}: confirmed, message delivered'
+    if status == "rejected":
+        return f'{check['to']}: declined the project, nothing was shared'
+    if status == "expired":
+        reason = record.get("reason", "expired")
+        return f'{check['to']}: {reason}, nothing was shared'
+    return None
+
+
+def _report_outcome(client, record, seconds):
+    """Wait a little and say whether the message actually landed.
+
+    A send returns the moment the question is asked, which tells the
+    sender nothing about whether anyone answered it. For an agent that
+    matters more than it would for a person: it has no terminal to watch
+    and no reason to look again, so silence reads as success and a
+    message that was never delivered looks exactly like one that was.
+
+    Bounded on purpose. This is a courtesy at the end of a send, not a
+    reason for the shell to hang: what is not decided by the deadline is
+    reported as undecided rather than waited out.
+
+    Args:
+        client (Bus): Connection for the calling window.
+        record (dict): The queued send record.
+        seconds (float): Longest time to wait for an answer.
+    """
+    checks = [item for item in record.get("confirmations", [])
+              if item.get("confirmation_id")]
+    if not checks or seconds <= 0:
+        return
+
+    deadline = time.time() + seconds
+    pending = list(checks)
+    while pending:
+        for check in list(pending):
+            line = _outcome_line(client, check)
+            if line is not None:
+                print(line, file=sys.stderr)
+                pending.remove(check)
+        if not pending:
+            return
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        # The status is written by the other window, and every write to
+        # the bus rings. Sleeping on that beats spinning on the file.
+        if not notify.wait(_as_agent(client, record["from"]),
+                           client.session, min(remaining, 2.0)):
+            time.sleep(min(max(remaining, 0), 0.5))
+
+    for check in pending:
+        print(f'{check['to']}: no answer yet, nothing shared so far',
+              file=sys.stderr)
 
 
 def _name_command(client, argv):
@@ -299,6 +374,11 @@ def _confirm_command(client, argv):
     print(f"Project {result['status']}: {result.get('id', argv[2])}")
     return 0
 
+
+# How long a send waits to find out whether its message landed, before
+# saying so and returning. Short: the sender is usually an agent part
+# way through a turn, and the answer is worth a moment but not a stall.
+SEND_WAIT_SECONDS = float(os.environ.get("AGENTBUS_SEND_WAIT", "12"))
 
 # How long a bare "wait" listens before giving up. Long enough that a
 # window armed once stays armed through an ordinary working session,
