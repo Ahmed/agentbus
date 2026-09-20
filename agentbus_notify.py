@@ -222,6 +222,39 @@ def _subscriber():
     return client
 
 
+def wait_or_sleep(agent, session, timeout, floor):
+    """Wait for a ring, and never return faster than a poll would.
+
+    The guarantee callers actually need. wait() reports "no ring" the
+    instant it cannot reach a doorbell, which is the right answer and a
+    terrible thing to put in a loop: a caller that only sleeps when the
+    doorbell is switched *off* will spin at full tilt when it is
+    switched on and merely unreachable -- library installed, server
+    down, which is the ordinary way Redis fails.
+
+    Keying the fallback on elapsed time rather than on configuration
+    covers every one of those: disabled, missing, refused, dropped
+    mid-wait.
+
+    Args:
+        agent (str): CLI name the window answers to.
+        session (str or None): That window's session id, when known.
+        timeout (float): Longest time to wait for a ring.
+        floor (float): Least time to have spent before returning without
+            one, so the caller's loop cannot become a spin.
+
+    Returns:
+        bool: True only if a ring actually arrived.
+    """
+    started = time.time()
+    if wait(agent, session, timeout):
+        return True
+    spent = time.time() - started
+    if spent < floor:
+        time.sleep(min(floor - spent, max(timeout, 0.0)))
+    return False
+
+
 def wait(agent, session, timeout):
     """Block until somebody rings for this window, or the time runs out.
 

@@ -166,16 +166,23 @@ class NotifyWithRedisTests(fixtures.BusFixture):
         self.assertLess(time.time() - started, 1)
 
     @mock.patch.dict("os.environ", {"AGENTBUS_STOP_WAIT": ""})
-    def test_codex_listens_by_default_and_others_do_not(self):
-        """Only the CLI whose hook timeout allows it holds a turn open.
+    def test_no_cli_holds_a_turn_open_by_default(self):
+        """Ending a turn must not cost a window time it will not use.
 
-        The environment override is cleared here because the suite sets
-        it to zero everywhere else, and what is under test is the
-        built-in default rather than the override.
+        This held codex turns open for eight seconds each, paid on every
+        turn that ended with an empty inbox whether or not any mail was
+        coming. The environment override is cleared here because the
+        suite sets it to zero everywhere else, and what is under test is
+        the built-in default.
         """
-        self.assertGreater(session_hook.stop_wait("codex"), 0)
+        self.assertEqual(session_hook.stop_wait("codex"), 0)
         self.assertEqual(session_hook.stop_wait("gemini"), 0)
         self.assertEqual(session_hook.stop_wait("claude"), 0)
+
+    @mock.patch.dict("os.environ", {"AGENTBUS_STOP_WAIT": "3"})
+    def test_the_hold_can_still_be_asked_for(self):
+        """Anyone who wants the belt as well as the braces may have it."""
+        self.assertEqual(session_hook.stop_wait("codex"), 3)
 
     def test_a_ring_for_another_window_is_not_ours(self):
         """A message addressed elsewhere must not wake this window."""
@@ -187,6 +194,51 @@ class NotifyWithRedisTests(fixtures.BusFixture):
         listener.join(timeout=10)
 
         self.assertFalse(self.answered)
+
+
+class FallbackSleepTests(unittest.TestCase):
+    """A doorbell that cannot be reached must not become a spin."""
+
+    def setUp(self):
+        """Forget any connection a previous test opened."""
+        super().setUp()
+        notify.reset()
+        self.addCleanup(notify.reset)
+
+    @mock.patch.object(notify, "REDIS_URL", "redis://127.0.0.1:6399/5")
+    def test_an_unreachable_server_still_costs_the_floor(self):
+        """Installed library, dead server: the ordinary way Redis fails.
+
+        wait() answers "no ring" instantly here, which is correct and
+        ruinous in a loop -- the caller would spin at full tilt for as
+        long as the server stayed down. The floor is what stops that.
+        """
+        started = time.time()
+
+        rang = notify.wait_or_sleep("claude", "session", 5.0, 0.3)
+
+        self.assertFalse(rang)
+        self.assertGreaterEqual(time.time() - started, 0.25)
+        self.assertLess(time.time() - started, 3)
+
+    @mock.patch.dict("os.environ", {"AGENTBUS_REDIS": "0"})
+    def test_a_disabled_doorbell_also_costs_the_floor(self):
+        """Switched off is the same shape of problem as unreachable."""
+        started = time.time()
+
+        rang = notify.wait_or_sleep("claude", "session", 20.0, 0.3)
+
+        self.assertFalse(rang)
+        self.assertGreaterEqual(time.time() - started, 0.25)
+
+    @mock.patch.dict("os.environ", {"AGENTBUS_REDIS": "0"})
+    def test_the_floor_never_outlasts_the_timeout(self):
+        """A caller asking for a short wait must not be held longer."""
+        started = time.time()
+
+        notify.wait_or_sleep("claude", "session", 0.2, 30.0)
+
+        self.assertLess(time.time() - started, 5)
 
 
 class WindowNameTests(fixtures.BusFixture):

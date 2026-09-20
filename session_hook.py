@@ -129,12 +129,21 @@ WATCHER_ENV = "AGENTBUS_WATCHER"
 # little latency at the end of each turn into real delivery for that
 # whole window.
 #
-# Per CLI, because the ceiling is the CLI's own hook timeout and a hook
-# killed for running long is worse than one that returned early. Codex
-# allows ten seconds, so eight leaves room for the rest of the hook.
-# Gemini fires no Stop event at all, so there is no moment to hold.
-# AGENTBUS_STOP_WAIT overrides any of this; zero switches it off.
-STOP_WAIT_DEFAULTS = {"codex": 8.0}
+# Off everywhere by default, and that default was bought the hard way.
+#
+# Holding the hook open also charges the wait to EVERY turn that ends
+# with an empty inbox, which is nearly all of them: eight seconds each,
+# measured, paid whether or not any mail was ever coming. That is not a
+# delay to mail, it is a tax on the window's own work, and it costs far
+# more than the gap it closes.
+#
+# The gap is covered better elsewhere. The watcher wakes an idle codex
+# window through its daemon within about half a second of mail landing,
+# and charges nothing to a turn with nothing waiting for it.
+#
+# AGENTBUS_STOP_WAIT turns it back on for anyone who wants the belt as
+# well as the braces, and should be small if so.
+STOP_WAIT_DEFAULTS = {}
 
 
 def stop_wait(agent):

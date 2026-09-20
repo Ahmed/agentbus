@@ -280,6 +280,51 @@ def _log(message):
         pass
 
 
+def _due(waiting, first_seen, announced):
+    """Split the waiting mail by what it has earned.
+
+    Two thresholds over one scan: anything old enough to wake a window,
+    and the older subset that has earned interrupting a person.
+
+    Args:
+        waiting (list[dict]): The mail currently on the bus for us.
+        first_seen (dict): When each id was first observed.
+        announced (set): Ids already acted on.
+
+    Returns:
+        tuple[list, list]: Records worth waking for, and worth ringing.
+    """
+    now = time.time()
+    ripe = _ripe(waiting, first_seen, announced, now, WAKE_GRACE_SECONDS)
+    loud = _ripe(waiting, first_seen, announced, now, GRACE_SECONDS)
+    return ripe, loud
+
+
+def _next_look(first_seen, announced, ceiling):
+    """How long we may block before something becomes due.
+
+    A message held back by its grace has no second ring coming. If the
+    loop blocks past the moment that message ripens, the grace stops
+    being a half-second delay and becomes however long the block was.
+
+    Args:
+        first_seen (dict): When each waiting id was first observed.
+        announced (set): Ids already acted on, which are not due again.
+        ceiling (float): The longest block to allow when nothing is due.
+
+    Returns:
+        float: Seconds to block for.
+    """
+    pending = [seen for key, seen in first_seen.items()
+               if key not in announced]
+    if not pending:
+        return ceiling
+    due = min(pending) + WAKE_GRACE_SECONDS - time.time()
+    if due <= 0:
+        return 0.0
+    return min(ceiling, due)
+
+
 def _ripe(waiting, first_seen, announced, now, grace):
     """The mail that has sat unread long enough to act on.
 
@@ -380,12 +425,7 @@ def main():
             # over; the next look will find whatever is there.
             waiting = []
 
-        # Two thresholds over one scan: anything ripe enough to wake,
-        # and the older subset that has earned an interruption.
-        now = time.time()
-        ripe = _ripe(waiting, first_seen, announced, now,
-                     WAKE_GRACE_SECONDS)
-        loud = _ripe(waiting, first_seen, announced, now, GRACE_SECONDS)
+        ripe, loud = _due(waiting, first_seen, announced)
 
         if ripe:
             handle_name = bus.current_handle(client, options.agent)
@@ -402,11 +442,19 @@ def main():
                 _log(("woke for " if woken else "observed unread ")
                      + ",".join(r["id"] for r in ripe))
 
-        # Block on the doorbell rather than sleeping through it. Without
-        # a doorbell this falls back to the interval it always used.
-        if not notify.wait(options.agent, options.session, LISTEN_SECONDS):
-            if not notify.enabled():
-                time.sleep(POLL_SECONDS)
+        # Never out-sleep mail that is only waiting on its grace. The
+        # ring for it has already been and gone -- it fired before this
+        # loop came back round to subscribe -- so nothing further will
+        # arrive to wake us, and blocking for the full ceiling would
+        # turn a half-second grace into the whole listen window.
+        listen = _next_look(first_seen, announced, LISTEN_SECONDS)
+
+        # Otherwise block on the doorbell rather than sleeping through
+        # it, and never come back faster than the old interval when
+        # there is no doorbell -- a watcher that spun here would burn a
+        # core for as long as Redis stayed down.
+        notify.wait_or_sleep(options.agent, options.session,
+                             listen, min(listen, POLL_SECONDS))
 
 
 if __name__ == "__main__":

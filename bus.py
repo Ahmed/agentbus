@@ -322,10 +322,9 @@ def _report_outcome(client, record, seconds):
         # The status is written by the other window, and every write to
         # the bus rings, so this returns the moment there is something
         # to look at rather than on a timer.
-        if not notify.wait(_as_agent(client, record["from"]),
-                           client.session, remaining):
-            if not notify.enabled():
-                time.sleep(min(max(remaining, 0), 0.25))
+        notify.wait_or_sleep(_as_agent(client, record["from"]),
+                             client.session, remaining,
+                             min(max(remaining, 0), 0.25))
 
     for check in pending:
         print(f'{check['to']}: no answer yet, nothing shared so far',
@@ -441,10 +440,9 @@ def _wait_command(client, argv):
         # A ring only says "look"; the loop above is what decides
         # whether anything is actually here. Without a doorbell this
         # falls back to the same polling the watcher does.
-        if not notify.wait(agent, client.session,
-                           min(remaining, WAIT_SECONDS)):
-            if not notify.enabled():
-                time.sleep(min(remaining, WAIT_POLL_SECONDS))
+        notify.wait_or_sleep(agent, client.session,
+                             min(remaining, WAIT_SECONDS),
+                             min(remaining, WAIT_POLL_SECONDS))
 
 
 def _utility_command(client, argv):
