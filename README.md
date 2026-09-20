@@ -48,15 +48,30 @@ session id, unique but meaningless. A window working on something worth
 addressing should take a name that says so:
 
 ```
-set_name("claude-sso-login")   # the MCP tool
-bmail name claude-sso-login    # from a shell
+set_name("claude-sso-login")   # the MCP tool -> claude-sso-login-001
+bmail name claude-sso-login    # from a shell -> claude-sso-login-001
 ```
 
-The name has to be free. A name a live session already publishes is
-refused, and so is a bare CLI name (`codex` reaches every Codex window, so
-no single window may answer to it) — the error says who holds it, and the
-caller picks another. A name dies with the window that held it: once the
-session is gone the next one may take it.
+The published name carries a three-digit number the bus adds. Two windows
+opening on one task both want to be called after it, and the useful answer
+is to say which is which rather than to refuse the second and make it
+invent a name that no longer describes the work: the next window asking for
+`claude-sso-login` is published as `claude-sso-login-002`. So a window can
+name itself without first reading the roster to see who else is here, and
+the roster never carries two windows a sender cannot tell apart. Ask for
+the task; read back the name you were given, because that is the address.
+
+The lowest free number is taken rather than the next one up, so numbers a
+finished window frees come back into use. A name dies with the window that
+held it: once the session is gone its number is free again.
+
+A name written with a number already on it — `claude-sso-login-004` — means
+that particular window and is published as written, or refused if a live
+session holds it. The number is also what keeps a window from answering to
+a bare CLI name: asking for `codex` gets you `codex-001`, which is an
+address for one window, while `codex` itself goes on reaching every Codex
+window. A name has to be at most 28 characters to leave room for its
+number.
 
 Renaming shows up on the roster immediately, and mail keeps arriving
 either way — a read as the CLI name collects everything addressed to the

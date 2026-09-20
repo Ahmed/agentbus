@@ -20,9 +20,10 @@ see each message once and other sessions still get their own copy:
 
 **Name this window after the task you are on**, so the roster says who is
 doing what and another agent can reach you rather than any window of your
-CLI. The name has to be one no live session already holds:
+CLI. A three-digit number is added on the end, so the name is yours even
+if another window is already on the task -- read back what you were given:
 
-    $BUS name NAME-<task>
+    $BUS name NAME-<task>          # published as NAME-<task>-001
 
 **Send to another agent:**
 
