@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Local deny-list of private names; never committed.
+.agentbus-deny

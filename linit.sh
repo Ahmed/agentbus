@@ -17,6 +17,20 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Words that may not appear anywhere in this repository, as an extended
+# regex. Read from an untracked file, never written down here: a list
+# that names the private things is the very leak it exists to prevent,
+# which is a mistake this file has already made once.
+#
+# Put one pattern per line in .agentbus-deny (gitignored), or set
+# AGENTBUS_DENY directly. Empty by default, so the check is inert until
+# somebody says what their own private names are.
+DENY_FILE="${AGENTBUS_DENY_FILE:-$SCRIPT_DIR/.agentbus-deny}"
+if [ -z "${AGENTBUS_DENY:-}" ] && [ -f "$DENY_FILE" ]; then
+  AGENTBUS_DENY="$(grep -vE '^\s*(#|$)' "$DENY_FILE" | paste -sd '|' -)"
+fi
+AGENTBUS_DENY="${AGENTBUS_DENY:-}"
+
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
   mapfile -t TARGETS < <(
@@ -42,6 +56,25 @@ isort_status=$?
 autopep8 --in-place --aggressive --aggressive "${TARGETS[@]}"
 autopep8_status=$?
 
+# Names from private work must not be used as worked examples. This has
+# happened: a real task name reached a public repository as a docstring
+# example and had to be purged from every commit after the fact. A grep
+# is a poor substitute for judgement, but it is the only thing that runs
+# every time and it costs nothing.
+deny_status=0
+leaked=""
+if [ -n "$AGENTBUS_DENY" ]; then
+  leaked=$(grep -rniE "$AGENTBUS_DENY" . \
+    --exclude-dir=.git --exclude-dir=__pycache__ \
+    --exclude=.agentbus-deny || true)
+fi
+if [ -n "$leaked" ]; then
+  echo "refusing: private project names used as examples" >&2
+  printf '%s\n' "$leaked" >&2
+  echo "Use an invented name in examples, never a real one." >&2
+  deny_status=1
+fi
+
 flake8 --docstring-convention=google \
   --per-file-ignores="__init__.py:D104" "${TARGETS[@]}"
 flake_status=$?
@@ -58,4 +91,4 @@ pylint \
 pylint_status=$?
 
 exit $((flake_status | pylint_status | pydocstyle_status \
-  | isort_status | autopep8_status | autoflake_status))
+  | isort_status | autopep8_status | autoflake_status | deny_status))
