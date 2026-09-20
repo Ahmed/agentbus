@@ -100,6 +100,21 @@ WAKE_WINDOW_SECONDS = 300
 MAX_WAKES_PER_WINDOW = int(os.environ.get("AGENTBUS_MAX_WAKES", "10"))
 
 
+# The CLIs that wake when a command they backgrounded exits, and so can
+# be handed a blocking listener instead of being rung at.
+#
+# This is the whole of what makes delivery possible for them. Nothing can
+# push text into a turn from outside, but a session that reports a
+# finished background command has, in effect, an interrupt -- and
+# `bus.py wait` is a command that finishes exactly when mail arrives.
+#
+# It cannot be armed from here. A hook is a child process; the listener
+# has to be started by the session itself, through its own tools, or its
+# exit reaches nobody. So the hook asks, in the text it injects, and the
+# session does it. That is the same reason this system briefs a model in
+# a prompt rather than documenting itself and hoping.
+WAKE_BY_BACKGROUND = ("claude",)
+
 # Set AGENTBUS_WATCHER=0 to start no watcher, for anyone who wants the
 # hooks and not a background process per window.
 WATCHER_ENV = "AGENTBUS_WATCHER"
@@ -196,6 +211,31 @@ def autoname(client, agent):
         return bus.set_name(client, stem)
     except ValueError:
         return current
+
+
+def _arm_listener(agent):
+    """Ask the session to put a blocking listener behind itself.
+
+    Returns:
+        str or None: Instructions to inject, or None for a CLI that
+            gains nothing from them.
+    """
+    if agent not in WAKE_BY_BACKGROUND:
+        return None
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "bus.py")
+    return (
+        "Agent bus: arm your mail listener now, before anything else, "
+        "and re-arm it every time it returns.\n"
+        f"Run this as a BACKGROUND command: python3 {script} wait "
+        f"{agent}\n"
+        "It blocks until mail arrives and then exits. Your session is "
+        "woken when a background command finishes, so this is the only "
+        "thing that lets another agent reach you once your turn has "
+        "ended -- without it their message waits for the operator to "
+        "type, and expires after ten minutes if they do not.\n"
+        "When it returns, read your mail, deal with it, and start "
+        "another one. Do not wait for it in the foreground.")
 
 
 def _start_watcher(client, agent):
@@ -434,6 +474,10 @@ def _preamble(agent, messages, woken=False):
             "bus.py confirm command in the check. A receipt is not "
             "confirmation. The task details remain withheld until you "
             "explicitly confirm.")
+    arming = _arm_listener(agent)
+    if arming:
+        lines.append(arming)
+
     lines.append("")
     lines.append(bus.format_messages(messages))
     return "\n".join(lines)
@@ -481,6 +525,12 @@ def main():
     if event == "SessionStart":
         autoname(client, options.agent)
         _start_watcher(client, options.agent)
+        arming = _arm_listener(options.agent)
+        if arming and not bus.peek(client, options.agent):
+            # Said on its own only when there is no mail to carry it,
+            # so a session never gets two injected blocks at once.
+            _emit(event, arming)
+            return 0
 
     if event in TURN_START_EVENTS:
         # Somebody is at the keyboard, so the runaway budgets start over.
