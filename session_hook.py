@@ -40,6 +40,14 @@ rather than assumed:
                    There is no way to continue a Gemini turn from a hook,
                    so Gemini keeps per-tool delivery and nothing more.
 
+There is still one window this cannot reach: the one sitting at an empty
+prompt, which fires no hook of any kind and so is never asked anything.
+Nothing can put a message into that conversation from outside -- see
+watcher.py for why the obvious routes are all closed -- so SessionStart
+starts a watcher behind each window instead, which rings the terminal and
+raises a desktop notification when mail goes unread. The operator presses
+Enter and the ordinary hooks take it from there.
+
 Nothing here is allowed to break the session it is attached to. A missing
 bus, a malformed payload or an unknown event all exit 0 with no output,
 because a broken message bus must never stop someone coding.
@@ -48,6 +56,7 @@ because a broken message bus must never stop someone coding.
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -94,6 +103,48 @@ MAX_CHAIN_CONTINUATIONS = int(os.environ.get("AGENTBUS_MAX_CONTINUATIONS", "3"))
 # sessions talking until the money runs out.
 WAKE_WINDOW_SECONDS = 300
 MAX_WAKES_PER_WINDOW = int(os.environ.get("AGENTBUS_MAX_WAKES", "10"))
+
+
+# Set AGENTBUS_WATCHER=0 to start no watcher, for anyone who wants the
+# hooks and not a background process per window.
+WATCHER_ENV = "AGENTBUS_WATCHER"
+
+
+def _start_watcher(client, agent, payload):
+    """Put a bell-ringer behind this window, if one is not there already.
+
+    Spawned detached and never waited on: the CLI blocks on this hook, so
+    anything that took time here would be felt as the session being slow
+    to start. It is deduplicated by a lock the watcher takes itself, so
+    firing SessionStart again -- on resume, on clear -- costs one process
+    that exits immediately rather than a second bell.
+
+    The session and cwd are passed explicitly because the child is put in
+    its own session group: by the time it looks, its parent is init and
+    walking the process tree would find nothing. The CLI's pid goes with
+    them, as the thing it follows and the tty it rings.
+    """
+    if os.environ.get(WATCHER_ENV) == "0":
+        return
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "watcher.py")
+    if not os.path.exists(script):
+        return
+    command = [sys.executable, script,
+               "--agent", agent,
+               "--session", client.session,
+               "--cwd", client.cwd]
+    window = bus.session_pid()
+    if window:
+        command += ["--pid", str(window)]
+    try:
+        with open(os.devnull, "r+b") as null:
+            subprocess.Popen(command, stdin=null, stdout=null, stderr=null,
+                             start_new_session=True, close_fds=True)
+    except (IOError, OSError):
+        # A watcher that will not start is a lost bell, not a broken
+        # session. The hooks still deliver exactly as they did before.
+        pass
 
 
 def _wake_path(client):
@@ -288,6 +339,9 @@ def main():
     bus.register(client, options.agent, status=status,
                  cwd=payload.get("cwd") or os.getcwd(),
                  session=payload.get("session_id"))
+
+    if event == "SessionStart":
+        _start_watcher(client, options.agent, payload)
 
     if event in TURN_START_EVENTS:
         # Somebody is at the keyboard, so the runaway budgets start over.

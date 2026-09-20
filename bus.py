@@ -387,6 +387,31 @@ def _is_shared_daemon(pid):
     return "app-server" in cmdline or "--managed-daemon" in cmdline
 
 
+def session_pid():
+    """The pid of the CLI window this process is running under.
+
+    The session id a CLI hands its hooks is a uuid, which identifies the
+    conversation and says nothing about the terminal it is drawn on. A
+    watcher needs the process itself for both of its jobs: the tty to
+    ring is found through it, and its death is how the watcher knows to
+    exit rather than outliving the window it was started for.
+
+    Returns:
+        The pid, or None when no CLI is among our ancestors -- which is
+        the normal answer when bus.py is run from a plain shell.
+    """
+    pid = os.getpid()
+    for _step in range(12):
+        parent = _parent_of(pid)
+        if not parent or parent == pid:
+            return None
+        if (_process_name(parent) in CLI_NAMES
+                and not _is_shared_daemon(parent)):
+            return parent
+        pid = parent
+    return None
+
+
 def _session_key():
     """Identify the CLI window this process belongs to.
 
@@ -945,20 +970,31 @@ def agents(bus):
     return rows
 
 
-def unread_count(bus, agent, session=None):
-    """Count messages an agent session has not read yet.
+def peek(bus, agent, session=None):
+    """The mail a session has waiting, without consuming any of it.
 
-    The session must be the one being asked about. Counting against the
-    caller's own cursor reports "messages since I last looked", which is
-    a different and useless number.
+    Deliberately not a read. The cursor does not move and nothing is
+    settled, so looking here cannot take a message away from the window
+    it belongs to -- which is the whole requirement for the watcher, a
+    process that must be able to see mail in order to ring about it and
+    must never be the reader that spends it.
+
+    The session must be the one being asked about. Scanning from the
+    caller's own cursor answers "what has crossed the bus since I last
+    looked", which is a different and useless question.
     """
     path = os.path.join(bus.state, "cursor.%s.%s"
                         % (agent, session or bus.session))
     entries, _position = _scan(bus, _read_cursor(path))
     cutoff = time.time() - MESSAGE_TTL_SECONDS
     consumed = consumed_ids(bus)
-    return len([r for r, _end in entries
-                if _for_me(bus, agent, r, cutoff, consumed)])
+    return [r for r, _end in entries
+            if _for_me(bus, agent, r, cutoff, consumed)]
+
+
+def unread_count(bus, agent, session=None):
+    """Count messages an agent session has not read yet."""
+    return len(peek(bus, agent, session))
 
 
 def _load_tasks(bus):

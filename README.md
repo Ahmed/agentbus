@@ -5,7 +5,8 @@ through, plus the MCP server and session hooks that connect them to it.
 
 ```
 /tmp/agentbus/bus.jsonl      one JSON message per line
-/tmp/agentbus/state/         read positions, presence, delivery and task ledgers
+/tmp/agentbus/state/         read positions, presence, delivery and task ledgers,
+                             one watcher lock per window
 ```
 
 No Redis, no daemon, no server.
@@ -97,6 +98,7 @@ acknowledged, so two windows reading each other do not trade them forever.
 | `bus.py` | The bus: append, read, presence, tasks. Also a shell CLI. |
 | `agentbus_server.py` | MCP server. One process per session, named by `--agent`. |
 | `session_hook.py` | Session hook that delivers waiting mail into a conversation, and wakes a Claude or Codex turn that was about to end. Speaks all three CLIs' hook dialects. |
+| `watcher.py` | One background process per window. Rings the terminal and raises a desktop notification when mail goes unread. Never reads it. |
 | `shell.sh` | Shadows `claude`/`codex`/`gemini` so a bare start briefs the session. `bmail`, `bwatch`. |
 | `*_hooks_snippet.json` | Hook config to install into each CLI. |
 
@@ -180,6 +182,62 @@ delivers it later rather than the bus swallowing it.
 
 `--no-wake` on `session_hook.py` delivers at the end of a turn without
 continuing it, for anyone who wants the notification and not the autonomy.
+
+## The window that is not looking
+
+One gap survives all of that. Every hook is a reply to something the CLI
+asked, so a window sitting at an empty prompt fires none of them: not
+`PostToolUse`, because it is running no tools, and not `Stop`, because its
+turn ended long ago. Its mail waits for the operator to type something, and
+the operator has no way of knowing there is anything to type for.
+
+`watcher.py` is one background process per window, started by
+`session_hook.py` at `SessionStart`. It **rings the terminal bell and
+raises a desktop notification**, and that is all it does.
+
+It cannot do more, and the reasons are worth writing down so nobody
+re-derives them:
+
+| Route into an idle window | Why not |
+| --- | --- |
+| Keystroke injection (`TIOCSTI`) | `dev.tty.legacy_tiocsti = 0` on this kernel, and on most since 6.2 |
+| Writing to the window's stdout | Paints characters over a TUI that is redrawing. A bell is the exception: no glyph, so nothing to corrupt |
+| The hook interface | A reply to a question the CLI asked. Not a door to knock on |
+| `tmux send-keys` | Genuinely works — and needs every CLI launched inside tmux, which is a different decision than this one |
+
+So the promise is a smaller one than push delivery, and it is honest: the
+bell says look, the operator presses Enter, the ordinary hooks deliver.
+
+### Two rules it must not break
+
+**It never consumes.** It looks with `bus.peek`, which scans without moving
+the cursor and without settling delivery, so the mail it rings about is
+still there for the window's own hook. A watcher that read the message
+would be a watcher that stole it.
+
+**It never touches presence.** `bus.touch` here would refresh the heartbeat
+of a window doing nothing, so the roster would show every watched window as
+permanently online, and `_live_addressees` would count it as an addressee
+that can never read — which would strand mail as permanently half-delivered.
+Presence has to keep meaning "a hook fired recently".
+
+### The details that matter
+
+- **One per window**, held by an exclusive lock on
+  `state/watch.<agent>.<session>.lock`. `SessionStart` fires again on resume
+  and on clear; the second watcher takes one look at the lock and exits.
+- **It dies with its window.** It follows the CLI's pid and exits when that
+  process goes, so closing a terminal takes its watcher with it.
+- **A five second grace before ringing.** A window that is mid-task collects
+  its own mail on the next `PostToolUse` within seconds; ringing for that is
+  noise about a problem that does not exist. The bell is for mail that is
+  genuinely stuck.
+- **Session and cwd are passed in, not guessed.** The child is detached into
+  its own session group, so by the time it looks its parent is init.
+- `AGENTBUS_WATCHER=0` starts no watcher. `--no-notify` rings the tty and
+  raises no popup. `AGENTBUS_WATCHER_LOG=<file>` is the only way it ever
+  says anything — a detached process must not print to the descriptors it
+  inherited.
 
 ## Installing
 
