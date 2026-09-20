@@ -189,7 +189,7 @@ async def send_message(to: str, message: str, reply_to: str = "") -> str:
     Note:
         When the message reaches a window, an "[ack] ... read your message
         <id>" line comes back on your next receive_messages; until then
-        nobody has looked. Messages expire after a minute, so an unread
+        nobody has looked. Messages expire after ten minutes, so an unread
         one is gone rather than waiting.
 
     Returns:

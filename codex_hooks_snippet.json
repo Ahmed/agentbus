@@ -32,6 +32,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __AGENTBUS_DIR__/session_hook.py --agent codex",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

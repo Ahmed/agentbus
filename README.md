@@ -5,7 +5,7 @@ through, plus the MCP server and session hooks that connect them to it.
 
 ```
 /tmp/agentbus/bus.jsonl      one JSON message per line
-/tmp/agentbus/state/         read positions, presence, task ledger
+/tmp/agentbus/state/         read positions, presence, delivery and task ledgers
 ```
 
 No Redis, no daemon, no server.
@@ -19,7 +19,10 @@ empty inbox. That is wrong for this: a message addressed to `codex` should
 reach every Codex window.
 
 A log has no such behaviour. Each reader keeps its own byte offset and they
-all see everything. The offset lives in `state/cursor.<agent>.<session>`,
+all see everything. A message is still taken off the bus once it has been
+read — but only once *every* window it was addressed to has read it, which
+is the part a consumer group got wrong. See "A message leaves when it has
+been read". The offset lives in `state/cursor.<agent>.<session>`,
 where the session is found by walking up the process tree to the
 controlling CLI — so two windows of one CLI stay independent, while the MCP
 server and the hooks inside a single window share a position and no message
@@ -93,7 +96,7 @@ acknowledged, so two windows reading each other do not trade them forever.
 | --- | --- |
 | `bus.py` | The bus: append, read, presence, tasks. Also a shell CLI. |
 | `agentbus_server.py` | MCP server. One process per session, named by `--agent`. |
-| `session_hook.py` | Session hook that delivers waiting mail into a conversation. Speaks Claude's, Codex's and Gemini's hook dialects. |
+| `session_hook.py` | Session hook that delivers waiting mail into a conversation, and wakes a Claude or Codex turn that was about to end. Speaks all three CLIs' hook dialects. |
 | `shell.sh` | Shadows `claude`/`codex`/`gemini` so a bare start briefs the session. `bmail`, `bwatch`. |
 | `*_hooks_snippet.json` | Hook config to install into each CLI. |
 
@@ -118,13 +121,65 @@ longer a gate script in front of it.
 `SessionStart` and `UserPromptSubmit`/`BeforeAgent` stay on as a backstop
 for a session running no tools.
 
-**End-of-turn hooks are not used**, and each for its own reason, all three
-verified by Codex against the installed binaries and the CLIs' own docs:
-Codex's `Stop` rejects `hookSpecificOutput`, Gemini's `AfterAgent` does not
-carry `additionalContext`, and Claude's `Stop` `additionalContext`
-*continues the turn* — which is exactly the unattended continuation this
-design refuses. An earlier version of this file claimed Claude's `Stop`
-could not continue. It can, and the hook no longer handles that event.
+## Mail wakes a turn that was about to end
+
+Per-tool delivery still leaves the case that actually annoys: a window that
+has gone quiet runs no hooks, so its mail sits there until a human types
+something. That is not a message bus, it is a mailbox you have to go and
+check.
+
+`Stop` (Claude, Codex) fires at the moment the agent is about to stop, and
+a hook that answers it can hand back text the CLI feeds to the model
+*instead* of stopping. So mail that arrived during a piece of work is acted
+on at the end of that work, with nobody at the keyboard. The woken turn is
+told plainly that the operator did not ask for this, that it should act
+anyway, and that it must say what happened before it goes quiet again —
+that report is the only trace the operator gets.
+
+This is the unattended continuation earlier versions of this file refused
+on principle. It is here now by the owner's decision, bounded rather than
+forbidden.
+
+### What each CLI accepts, checked rather than assumed
+
+| CLI | End of turn | Verdict |
+| --- | --- | --- |
+| Claude 2.1.278 | `Stop` | Takes `decision: block` + `reason` **and** `hookSpecificOutput.additionalContext`; either continues the turn. Verified by running a headless session against a throwaway Stop hook. |
+| Codex 0.155.1 | `Stop` | Its embedded `stop.command.output` schema is `additionalProperties: false` with no `hookSpecificOutput` — but it does take `decision: block` + `reason`. |
+| Gemini 0.60.0 | `AfterAgent` | `AfterAgentHookOutput` honours only `clearContext`. A Gemini turn cannot be continued from a hook, so Gemini keeps per-tool delivery and nothing more. |
+
+`decision: block` + `reason` is therefore the one dialect Claude and Codex
+share, and it is what the hook emits on `Stop`. Nothing else rides along on
+that payload — Codex rejects any key its schema does not name, which is why
+the terminal bell is only ever sent on the delivery events.
+
+An earlier version of this file concluded that no end-of-turn hook could
+work, from Codex rejecting `hookSpecificOutput`. That was too broad: it
+rejects the *key*, not the continuation.
+
+### The budgets
+
+A hook that can restart a turn can restart it forever, so two bounds apply,
+both in `_claim_wake`:
+
+- **`AGENTBUS_MAX_CONTINUATIONS`** (default 3) — wakes within one
+  continuation chain. A chain is every `Stop` flowing from a single
+  operator prompt; the CLI names it with `prompt_id` (Claude) or `turn_id`
+  (Codex) and flags the later ones with `stop_hook_active`.
+- **`AGENTBUS_MAX_WAKES`** (default 10 per 5 minutes) — the coarser one.
+  Two windows answering each other start a *new* chain every time, so the
+  per-chain cap alone would not stop a pair of sessions talking until the
+  money ran out.
+
+A prompt from the operator clears both: somebody is watching, which is the
+thing the budgets stand in for.
+
+The budget is claimed **before** the mail is read, never after. A wake that
+is refused must leave the message unread, so an ordinary hook still
+delivers it later rather than the bus swallowing it.
+
+`--no-wake` on `session_hook.py` delivers at the end of a turn without
+continuing it, for anyone who wants the notification and not the autonomy.
 
 ## Installing
 
@@ -183,20 +238,58 @@ cat /tmp/agentbus/bus.jsonl              # it is just a file
 `bwatch` tails from the end of the file and keeps no cursor, so watching
 never affects what an agent receives.
 
-## Expiry
+## A message leaves when it has been read
 
-`MESSAGE_TTL_SECONDS` is **60 seconds**, by the owner's decision. The bus
-is live-only: a message is worth acting on while both sessions are on the
-same thing and is misleading afterwards.
+The ordinary end of a message is being read by everyone it was addressed
+to, not timing out. `_settle_delivery` records each session that has read
+it and tombstones it once the readers cover every session that is live
+*now* and answers to the address:
 
-The cost is real. A session that is mid-task, or has not yet reached its
-first tool call, will never see a message — it expires before the
-recipient looks. Delivery therefore depends entirely on the per-tool hooks
-firing; a human-paced nudge arrives too late. Age is still rendered on
-every message (`(12s ago)`).
+```
+to: "claude"            live: claude-a, claude-b
+  claude-a reads   -> still on the bus, claude-b has not seen it
+  claude-b reads   -> spent, and dropped at the next compaction
 
-Reads skip anything past its use-by date. The file is compacted when it
-passes 1MB, and `/tmp` clears on reboot.
+to: "claude-sso-login"  one window answers to that name
+  that window reads -> spent
+```
+
+So the fan-out survives — a message to a CLI name still reaches every
+window running it — while a message that has done its job stops being
+carried. A window that starts afterwards does not see it, which is the
+point: joining the machine is not a reason to be handed other windows'
+finished conversations.
+
+"Live" is the same test the roster prints, a heartbeat inside
+`PRESENCE_TTL_SECONDS`. The consequence is worth stating plainly: a window
+silent for longer than that is not counted as an addressee, so mail can be
+spent without it. Presence only refreshes when a hook fires, and a window
+sitting at an empty prompt fires none.
+
+The ledger lives in `state/delivered.json`, is held under a lock for the
+whole read-modify-write — three CLIs settle into it, and a lost update
+would strand a message as permanently half-read — and entries are pruned
+once the message they describe is past its TTL and can never be delivered
+again.
+
+## Expiry is the backstop
+
+`MESSAGE_TTL_SECONDS` is **600 seconds**, and only catches mail nobody
+ever read. It was 60 while delivery could ride on nothing but a hook the
+agent happened to fire, which made anything older than a minute
+misleading; a turn can now be woken at its end, so the window in which a
+message is worth acting on is wider, and an unread one is worth keeping
+for more than a minute.
+
+The cost is real, and neither the wake nor the longer TTL removes it. A
+message reaches a Claude or Codex window if that window runs a tool or
+finishes a turn inside the ten minutes; a window that sits at an empty
+prompt for longer, and every Gemini window between tools, still misses
+it. Age is rendered on every message (`(12s ago)`) so a recipient can see
+how stale the thing it is acting on was.
+
+Reads skip anything past its use-by date, and compaction drops it along
+with everything already spent. `/tmp` clears on reboot.
 
 ## Safety notes
 

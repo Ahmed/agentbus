@@ -39,16 +39,22 @@ BUS_FILE = os.path.join(BUS_DIR, "bus.jsonl")
 STATE_DIR = os.path.join(BUS_DIR, "state")
 TASK_FILE = os.path.join(STATE_DIR, "tasks.json")
 
-# Sixty seconds, the owner's number, asked for twice. The bus is
-# live-only: a message is worth acting on while both sessions are on the
-# same thing, and is misleading afterwards.
+# Ten minutes. This is the backstop, not the usual way a message leaves
+# the bus: a message is normally removed the moment it has been read by
+# everyone it was addressed to (see _settle_delivery). The TTL only
+# catches mail nobody ever looked at.
 #
-# The cost is real and worth knowing. A session that is mid-task, or that
-# has not yet reached its first tool call, will never see the message --
-# it is gone before the recipient looks. Delivery therefore depends
-# entirely on the per-tool hooks firing; a human-paced nudge arrives too
-# late. Age is still rendered on every message.
-MESSAGE_TTL_SECONDS = 60
+# It was sixty seconds when delivery could only ride on a hook the agent
+# happened to fire, which made anything older than a minute misleading. A
+# turn can now be woken at its end, so the window in which a message is
+# still worth acting on is wider, and an unread one is worth keeping for
+# more than a minute.
+#
+# The cost is still real. A window that is idle at its prompt runs no
+# hooks, so mail addressed to it waits for the operator either way; ten
+# minutes only widens the odds that something fires first. Age is
+# rendered on every message so a reader can judge how stale it is.
+MESSAGE_TTL_SECONDS = 600
 
 # Compaction rewrites the file without its expired lines. Triggered by size
 # rather than on a timer, because there is no daemon to run a timer.
@@ -432,7 +438,7 @@ def _append(bus, record):
 
 
 def _compact(bus):
-    """Rewrite the file without expired messages, if it has grown large.
+    """Rewrite the file without spent or expired messages, if it is large.
 
     Cursors are byte offsets, so a rewrite moves every reader's position.
     They are reset to the new end of file rather than rescanning: the
@@ -446,6 +452,7 @@ def _compact(bus):
         return
 
     cutoff = time.time() - MESSAGE_TTL_SECONDS
+    consumed = consumed_ids(bus)
     kept = []
     with open(bus.path) as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -454,6 +461,8 @@ def _compact(bus):
                 try:
                     record = json.loads(line)
                 except ValueError:
+                    continue
+                if record.get("id") in consumed:
                     continue
                 if record.get("ts", 0) >= cutoff:
                     kept.append(line)
@@ -467,6 +476,119 @@ def _compact(bus):
     for name in os.listdir(bus.state):
         if name.startswith("cursor."):
             _write_cursor_path(os.path.join(bus.state, name), end)
+
+
+def _delivery_path(bus):
+    """Where the record of who has read what is kept."""
+    return os.path.join(bus.state, "delivered.json")
+
+
+def _live_addressees(bus, to):
+    """Sessions that are online now and answer to this address.
+
+    "Online" is the same test the roster shows -- a heartbeat inside
+    PRESENCE_TTL_SECONDS -- so what the bus counts as an addressee is
+    what `bmail` prints, rather than a second private notion of alive.
+
+    The consequence is worth stating plainly: a window that has been
+    silent longer than that is not counted, so mail can be consumed
+    without it ever seeing it. Presence only refreshes when a hook fires,
+    and a window sitting at an empty prompt fires none.
+    """
+    now = time.time()
+    live = set()
+    for name in os.listdir(bus.state):
+        if not name.startswith("presence."):
+            continue
+        try:
+            with open(os.path.join(bus.state, name)) as handle:
+                record = json.load(handle)
+        except (IOError, OSError, ValueError):
+            continue
+        if now - record.get("last_seen", 0) >= PRESENCE_TTL_SECONDS:
+            continue
+        session = record.get("session")
+        if not session:
+            continue
+        agent = record.get("agent", "")
+        handle_name = record.get("handle") or default_handle(agent, session)
+        if to in (agent, handle_name):
+            live.add(session)
+    return live
+
+
+def _load_delivery(bus):
+    """Read the ledger, tolerating it not existing yet."""
+    try:
+        with open(_delivery_path(bus)) as handle:
+            return json.load(handle)
+    except (IOError, OSError, ValueError):
+        return {}
+
+
+def consumed_ids(bus):
+    """Message ids that have been read by everyone they were sent to."""
+    return set(key for key, entry in _load_delivery(bus).items()
+               if entry.get("done"))
+
+
+def _settle_delivery(bus, messages):
+    """Note that this session has read these, and drop the covered ones.
+
+    A message addressed to a CLI name reaches every window running it, so
+    one window reading it is not the end of its life -- that was the
+    consumer-group behaviour this bus exists to avoid. It is finished
+    once every session that is live *now* and answers to the address has
+    read it, which for a message sent to one window's handle is the
+    moment that window looks.
+
+    Held under a lock for the whole read-modify-write: three CLIs settle
+    into this file and a lost update would strand a message as
+    permanently half-read.
+
+    Returns:
+        The ids tombstoned by this call.
+    """
+    if not messages:
+        return []
+
+    finished = []
+    path = _delivery_path(bus)
+    lock = path + ".lock"
+    with open(lock, "a") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        try:
+            ledger = _load_delivery(bus)
+            cutoff = time.time() - MESSAGE_TTL_SECONDS
+            # Entries outlive the message they describe by nothing: once
+            # the line is past its TTL it can never be delivered again,
+            # so its bookkeeping is dead weight.
+            ledger = dict((key, entry) for key, entry in ledger.items()
+                          if entry.get("ts", 0) >= cutoff)
+
+            for message in messages:
+                key = message.get("id")
+                if not key:
+                    continue
+                entry = ledger.setdefault(key, {"ts": message.get("ts", 0),
+                                                "readers": [],
+                                                "done": False})
+                if bus.session not in entry["readers"]:
+                    entry["readers"].append(bus.session)
+                if entry.get("done"):
+                    continue
+                waiting = _live_addressees(bus, message.get("to", ""))
+                if waiting <= set(entry["readers"]):
+                    entry["done"] = True
+                    finished.append(key)
+
+            temporary = "%s.%d.tmp" % (path, os.getpid())
+            with open(temporary, "w") as out:
+                json.dump(ledger, out)
+            os.replace(temporary, path)
+        finally:
+            fcntl.flock(guard, fcntl.LOCK_UN)
+    return finished
 
 
 def _cursor_path(bus, agent):
@@ -566,8 +688,8 @@ def _scan(bus, offset):
     return entries, position
 
 
-def _for_me(bus, agent, record, cutoff):
-    """Is this message addressed to this session, and still fresh?
+def _for_me(bus, agent, record, cutoff, consumed=()):
+    """Is this message addressed to this session, still fresh, and unspent?
 
     The address matches either the CLI name, which reaches every window
     running it, or this session's published handle, which reaches only
@@ -578,9 +700,16 @@ def _for_me(bus, agent, record, cutoff):
     into silence and a window that had nothing to say looked the same
     from either side. The job stays on the roster as a label saying what
     each window is working on, which is the part that was ever useful.
+
+    A message leaves the bus two ways: every session it was addressed to
+    has read it, or it passed its TTL unread. `consumed` carries the
+    first of those -- the caller loads it once per scan rather than this
+    function re-reading the ledger for every line.
     """
     handle = current_handle(bus, agent)
     if record.get("to") not in (agent, handle):
+        return False
+    if record.get("id") in consumed:
         return False
     return record.get("ts", 0) >= cutoff
 
@@ -609,19 +738,24 @@ def receive(bus, agent, limit=10, block_ms=0, redelivered_first=False):
     while True:
         entries, position = _scan(bus, _read_cursor(path))
         cutoff = time.time() - MESSAGE_TTL_SECONDS
+        consumed = consumed_ids(bus)
         mine = []
         # Advance only past what is actually handed over. Moving the
         # cursor to the end of the scan while returning a truncated slice
         # silently destroyed every message the limit withheld.
         advance = position
         for record, end in entries:
-            if not _for_me(bus, agent, record, cutoff):
+            if not _for_me(bus, agent, record, cutoff, consumed):
                 continue
             mine.append(record)
             if len(mine) >= limit:
                 advance = end
                 break
         _write_cursor_path(path, advance)
+        if mine:
+            # Handing them over is the read. Record it now, so a message
+            # every addressee has seen stops being one the bus carries.
+            _settle_delivery(bus, mine)
         if mine or time.time() >= deadline:
             return mine
         time.sleep(0.25)
@@ -633,7 +767,8 @@ def receive_and_settle(bus, agent, limit=10, block_ms=0, fresh_only=False):
     Delivery here is the only moment the bus knows a message reached a
     model rather than merely being written down, so the receipt goes out
     now. Without it a sender cannot tell "nobody has looked yet" from
-    "seen and ignored", and messages expire after a minute either way.
+    "seen and ignored". It is also what spends the message: a read by
+    the last session it was addressed to takes it off the bus.
 
     Task bookkeeping is still done separately, so the agent that
     delegated can ask whether the work was picked up.
@@ -821,7 +956,9 @@ def unread_count(bus, agent, session=None):
                         % (agent, session or bus.session))
     entries, _position = _scan(bus, _read_cursor(path))
     cutoff = time.time() - MESSAGE_TTL_SECONDS
-    return len([r for r, _end in entries if _for_me(bus, agent, r, cutoff)])
+    consumed = consumed_ids(bus)
+    return len([r for r, _end in entries
+                if _for_me(bus, agent, r, cutoff, consumed)])
 
 
 def _load_tasks(bus):
