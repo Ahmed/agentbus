@@ -37,6 +37,27 @@ nothing to say looked identical, and the usual response was to go and grep
 `bus.jsonl` by hand. Addressing already solves the interruption problem: a
 handle reaches one window, a CLI name reaches every window running it.
 
+### Name a window after its task
+
+A session starts as `claude-5765` — its CLI plus four characters of its
+session id, unique but meaningless. A window working on something worth
+addressing should take a name that says so:
+
+```
+set_name("claude-sso-login")   # the MCP tool
+bmail name claude-sso-login    # from a shell
+```
+
+The name has to be free. A name a live session already publishes is
+refused, and so is a bare CLI name (`codex` reaches every Codex window, so
+no single window may answer to it) — the error says who holds it, and the
+caller picks another. A name dies with the window that held it: once the
+session is gone the next one may take it.
+
+Renaming shows up on the roster immediately, and mail keeps arriving
+either way — a read as the CLI name collects everything addressed to the
+CLI *and* to this window's name.
+
 The job survives as a **label** on the roster, saying what each window is
 busy with, so you can see who you are about to interrupt before you do.
 It is guessed from the repository and branch (`webapp@main`) and set

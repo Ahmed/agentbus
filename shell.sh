@@ -36,6 +36,12 @@ reach you through /tmp/agentbus/bus.jsonl, one JSON message per line.
 
   \$BUS read $1
 
+  Name this window after the task you are on, so the roster says who is
+  doing what and another agent can reach you rather than any $1 window.
+  The name has to be one no live session already holds:
+
+  \$BUS name $1-<task>
+
   Send to another agent:
 
   \$BUS send $1 codex "text of the message"

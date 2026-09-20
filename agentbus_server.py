@@ -66,17 +66,18 @@ async def whoami() -> str:
 
     Returns:
         The handle other agents use to reach this window specifically, the
-        CLI name that reaches every window running it, and the job that
-        and the job it is working on.
+        CLI name that reaches every window running it, and the job it is
+        working on.
     """
     bus_handle = await asyncio.to_thread(_client)
-    published = bus.default_handle(AGENT_NAME, bus_handle.session)
+    published = await asyncio.to_thread(
+        lambda: bus.current_handle(bus_handle, AGENT_NAME))
     return ("Published on the roster as %r. CLI name %r. Job %r.\n"
             "Send to %r to reach this window only, or to %r to reach every "
             "window running that CLI. Every session on this machine can "
             "reach every other; the job is a label saying what each one is "
-            "busy with. Change the published name with set_name and the "
-            "job with set_job."
+            "busy with. Name this window after the task it is on with "
+            "set_name, and change the job with set_job."
             % (published, AGENT_NAME, bus_handle.job, published, AGENT_NAME))
 
 
@@ -120,11 +121,17 @@ async def set_name(handle: str) -> str:
     Sending to a CLI name reaches every window running it, which is right
     for "any codex will do" and wrong for "the codex already looking at
     this file". A handle makes the second possible. Defaults to something
-    like "codex-7145"; give it a meaningful one when several windows of
-    the same CLI are working.
+    like "codex-7145"; name yourself after the task you are working on
+    instead, so the roster says who is doing what and another agent can
+    reach the right window.
+
+    The name must be free: one a live session already publishes is
+    refused, as is a bare CLI name. On a refusal, pick another and call
+    again.
 
     Args:
-        handle: Lowercase name, e.g. "codex-sso". Letters, digits, '-', '_'.
+        handle: Lowercase name for the task, e.g. "codex-sso-login".
+            Letters, digits, '-', '_'.
 
     Returns:
         The handle now published.

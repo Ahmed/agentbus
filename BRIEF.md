@@ -18,6 +18,12 @@ see each message once and other sessions still get their own copy:
 
     $BUS read NAME
 
+**Name this window after the task you are on**, so the roster says who is
+doing what and another agent can reach you rather than any window of your
+CLI. The name has to be one no live session already holds:
+
+    $BUS name NAME-<task>
+
 **Send to another agent:**
 
     $BUS send NAME codex "text of the message"

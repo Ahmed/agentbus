@@ -147,12 +147,57 @@ def _read_handle(state, session):
         return None
 
 
+def current_handle(bus, agent):
+    """The name this session publishes right now.
+
+    Args:
+        bus: Bus from connect().
+        agent: The CLI name, used only to build the default.
+
+    Returns:
+        The chosen name, or the generated one if none was chosen.
+    """
+    return (bus.handle or _read_handle(bus.state, bus.session)
+            or default_handle(agent, bus.session))
+
+
+def _name_conflict(bus, handle):
+    """Say why a name cannot be taken, or None if it is free.
+
+    Two windows answering to one name is worse than no name at all:
+    delivery matches on the handle, so both would receive mail meant for
+    one of them, and the roster would offer the sender no way to tell
+    them apart. A name a dead session left behind is free -- only live
+    windows hold one.
+
+    Args:
+        bus: Bus from connect().
+        handle: The name being claimed.
+
+    Returns:
+        A sentence naming the holder, or None.
+    """
+    for row in agents(bus):
+        if handle == row["name"]:
+            return ("%r is the CLI address for every %s window; mail sent "
+                    "to it reaches all of them" % (handle, row["name"]))
+        if not row["online"]:
+            continue
+        if row.get("session") == bus.session:
+            continue
+        if handle == row["handle"]:
+            return ("%r is already published by a live session working on "
+                    "%s" % (handle, row.get("job", "?")))
+    return None
+
+
 def set_name(bus, handle):
     """Publish a name for this session on the roster.
 
     Addressing an agent by CLI name reaches every window running it,
     which is right for "any codex will do" and wrong for "the codex that
-    is already looking at this file". A handle makes the second possible.
+    is already looking at this file". A handle makes the second possible,
+    so it is worth naming a window after the task it is on.
 
     Args:
         bus: Bus from connect().
@@ -160,12 +205,46 @@ def set_name(bus, handle):
 
     Returns:
         The handle now in effect.
+
+    Raises:
+        ValueError: The name is malformed, or another live session or a
+            CLI already answers to it.
     """
     check_name(handle)
+    conflict = _name_conflict(bus, handle)
+    if conflict:
+        raise ValueError("%s -- pick another" % conflict)
     with open(_handle_path(bus.state, bus.session), "w") as target:
         target.write(handle)
     bus.handle = handle
+    _republish_handle(bus, handle)
     return handle
+
+
+def _republish_handle(bus, handle):
+    """Write a new name into this session's presence rows at once.
+
+    The roster reads the name out of the presence file, which is only
+    rewritten on the next heartbeat. Without this, a window that has
+    just renamed itself still shows its old name to everyone deciding
+    whom to write to -- including the next window checking whether the
+    name is free.
+    """
+    tail = "." + bus.session
+    for name in os.listdir(bus.state):
+        if not name.startswith("presence.") or not name.endswith(tail):
+            continue
+        path = os.path.join(bus.state, name)
+        try:
+            with open(path) as source:
+                record = json.load(source)
+        except (IOError, OSError, ValueError):
+            continue
+        record["handle"] = handle
+        temporary = "%s.%d.tmp" % (path, os.getpid())
+        with open(temporary, "w") as target:
+            json.dump(record, target)
+        os.replace(temporary, path)
 
 
 def _job_path(state, session):
@@ -441,9 +520,7 @@ def send(bus, sender, to, text, kind="message", task_id=None,
     record = {"id": uuid.uuid4().hex[:12], "ts": time.time(), "from": sender,
               "to": to, "kind": kind, "text": text,
               "job": job or bus.job,
-              "from_handle": (bus.handle
-                              or _read_handle(bus.state, bus.session)
-                              or default_handle(sender, bus.session))}
+              "from_handle": current_handle(bus, sender)}
     if task_id:
         record["task_id"] = task_id
     if reply_to:
@@ -502,8 +579,7 @@ def _for_me(bus, agent, record, cutoff):
     from either side. The job stays on the roster as a label saying what
     each window is working on, which is the part that was ever useful.
     """
-    handle = (bus.handle or _read_handle(bus.state, bus.session)
-              or default_handle(agent, bus.session))
+    handle = current_handle(bus, agent)
     if record.get("to") not in (agent, handle):
         return False
     return record.get("ts", 0) >= cutoff
@@ -632,9 +708,7 @@ def touch(bus, agent, status=None, **info):
     record["session"] = bus.session
     record["job"] = bus.job
     record["agent"] = agent
-    record["handle"] = (bus.handle
-                        or _read_handle(bus.state, bus.session)
-                        or default_handle(agent, bus.session))
+    record["handle"] = current_handle(bus, agent)
     if status:
         record["status"] = status
     for name, value in info.items():
@@ -924,10 +998,16 @@ def _main(argv):
         return 0
 
     if command == "name":
-        if len(argv) > 1:
-            print(set_name(bus, argv[1]))
-        else:
+        if len(argv) < 2:
             print(_read_handle(bus.state, bus.session) or "(none set)")
+            return 0
+        # A refused name is an ordinary outcome -- the caller picks
+        # another -- so it prints a line rather than a traceback.
+        try:
+            print(set_name(bus, argv[1]))
+        except ValueError as error:
+            print("cannot take that name: %s" % error, file=sys.stderr)
+            return 1
         return 0
 
     if command == "job":
