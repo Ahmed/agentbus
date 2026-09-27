@@ -10,6 +10,7 @@ import time
 import agentbus_constants as constants
 import agentbus_context as context
 import agentbus_delivery as delivery
+import agentbus_events as events
 import agentbus_identity as identity
 import agentbus_messages as messages
 import agentbus_notify as notify
@@ -31,9 +32,7 @@ COMPACT_BYTES = constants.COMPACT_BYTES
 MESSAGE_KINDS = constants.MESSAGE_KINDS
 MESSAGE_TTL_SECONDS = constants.MESSAGE_TTL_SECONDS
 NAME_NUMBER = constants.NAME_NUMBER
-NAME_NUMBER_LIMIT = constants.NAME_NUMBER_LIMIT
 NAME_PATTERN = constants.NAME_PATTERN
-NAME_STEM_MAX = constants.NAME_STEM_MAX
 PRESENCE_REAP_SECONDS = constants.PRESENCE_REAP_SECONDS
 PRESENCE_TTL_SECONDS = constants.PRESENCE_TTL_SECONDS
 STATE_DIR = constants.STATE_DIR
@@ -41,6 +40,7 @@ TASK_FILE = constants.TASK_FILE
 
 default_handle = state.default_handle
 current_handle = state.current_handle
+current_task = state.current_task
 check_name = state.check_name
 default_job = state.default_job
 session_dead = identity.session_dead
@@ -52,6 +52,8 @@ get_task = storage.get_task
 new_task_id = storage.new_task_id
 touch = presence.touch
 register = presence.register
+ensure_handle = presence.ensure_handle
+names_a_chore = presence.names_a_chore
 resolve_recipient = routing.resolve_recipient
 send = messages.send
 _send_direct = messages.send_direct
@@ -107,6 +109,7 @@ class Bus:
         # "codex" is not an address when three windows answer to it, so a
         # sender that means one particular window has a name to use.
         self.handle = None
+        self.parent_session = None
 
     def current_handle(self, agent):
         """Expose the published name to clients sharing this connection.
@@ -202,7 +205,16 @@ def _as_agent(bus, name):
         known[published] = agent
     if name in known.values():
         return name
-    return known.get(name, name)
+    if name in known:
+        return known[name]
+    # A window that was told to call itself claude-<task> types that
+    # where its agent name belongs. Taken literally it registers a second
+    # identity for the same window, which shows up on the roster as a
+    # duplicate and reads mail from an inbox nobody writes to.
+    for agent in set(known.values()) or constants.AGENT_NAMES:
+        if name.startswith(agent + "-"):
+            return agent
+    return name
 
 
 def _print_message(message):
@@ -332,23 +344,36 @@ def _report_outcome(client, record, seconds):
 
 
 def _name_command(client, argv):
-    """Keep an unavailable name an ordinary, recoverable command outcome.
+    """Print this window's name and task, setting the task when given.
+
+    The name is the bus's to give and is never changed here; what the
+    window types is its task. A refused task is an ordinary, recoverable
+    outcome rather than a traceback.
 
     Args:
-        client (Bus): Connection whose published handle is inspected.
-        argv (list[str]): Name command and optional requested handle.
+        client (Bus): Connection whose name and task are shown.
+        argv (list[str]): Name command and optional task words.
 
     Returns:
         int: Shell exit status.
     """
-    if len(argv) < 2:
-        print(state.read_handle(client.state, client.session) or "(none set)")
-        return 0
-    try:
-        print(set_name(client, argv[1]))
-    except ValueError as error:
-        print(f"cannot take that name: {error}", file=sys.stderr)
-        return 1
+    rows = [row for row in presence.routing_rows(client)
+            if row["session"] == client.session]
+    if rows:
+        agent = rows[0]["agent"]
+    else:
+        agent = next((name for name in constants.AGENT_NAMES
+                      if len(argv) > 1 and argv[1].startswith(name + "-")),
+                     "claude")
+    handle = ensure_handle(client, agent)
+    if len(argv) > 1:
+        try:
+            set_task(client, " ".join(argv[1:]).replace(" ", "-"))
+        except ValueError as error:
+            print(f"cannot set that task: {error}", file=sys.stderr)
+            return 1
+    task = state.current_task(client, agent)
+    print(f"{handle} task={task or '(none yet)'}")
     return 0
 
 
@@ -381,68 +406,45 @@ def _confirm_command(client, argv):
 # way through a turn, and the answer is worth a moment but not a stall.
 SEND_WAIT_SECONDS = float(os.environ.get("AGENTBUS_SEND_WAIT", "6"))
 
-# How long a bare "wait" listens before giving up. Long enough that a
-# window armed once stays armed through an ordinary working session,
-# short enough that a forgotten listener does not live forever.
-WAIT_SECONDS = 3600.0
-
-# What to sleep between looks when there is no doorbell to block on. The
-# same interval the watcher polls at, for the same reason: a look is a
-# stat of one file.
-WAIT_POLL_SECONDS = 2.0
-
 
 def _wait_command(client, argv):
-    """Block until this window has mail, then exit so its CLI notices.
-
-    This is the one mechanism that reaches a window nobody is typing
-    into. A CLI that reports when a background command finishes will
-    surface this command's exit on its own, without the operator
-    pressing anything -- so arming it in the background and reading the
-    mail when it returns is delivery rather than a bell.
-
-    It returns on the first mail rather than looping, because exiting is
-    the whole signal. The caller reads its mail and arms another.
+    """Keep explicit shell waits silent until actual mail arrives.
 
     Args:
-        client (Bus): Connection for the calling window.
-        argv (list[str]): Wait command, the agent name, optional seconds.
+        client (Bus): Window whose inbox is observed without consuming it.
+        argv (list[str]): Command, agent, and optional finite timeout.
 
     Returns:
-        int: Zero when mail is waiting, one on a timeout, two on misuse.
+        int: Zero for mail or owner exit, one for an explicitly requested
+        timeout, and two for invalid arguments. The default has no timeout.
     """
     if len(argv) < 2:
         print("usage: bus.py wait <agent> [seconds]")
         return 2
-
     agent = _as_agent(client, argv[1])
+    deadline = None
     try:
-        limit = float(argv[2]) if len(argv) > 2 else WAIT_SECONDS
+        if len(argv) > 2:
+            deadline = time.monotonic() + float(argv[2])
     except ValueError:
         print("usage: bus.py wait <agent> [seconds]")
         return 2
-
-    deadline = time.time() + limit
-    while True:
-        waiting = peek(client, agent, client.session)
-        if waiting:
-            kinds = ", ".join(sorted({item.get("kind", "message")
-                                      for item in waiting}))
-            print(f"{len(waiting)} waiting for {agent} ({kinds}). "
-                  f"Read with: bus.py read {agent}")
-            return 0
-
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            print(f"no mail for {agent} within {limit:.0f}s")
-            return 1
-
-        # A ring only says "look"; the loop above is what decides
-        # whether anything is actually here. Without a doorbell this
-        # falls back to the same polling the watcher does.
-        notify.wait_or_sleep(agent, client.session,
-                             min(remaining, WAIT_SECONDS),
-                             min(remaining, WAIT_POLL_SECONDS))
+    with events.Listener(client, agent, pid=session_pid() or 0) as listener:
+        while True:
+            waiting = peek(client, agent, client.session)
+            actionable = [item for item in waiting
+                          if item.get("kind") not in ("ack", "project_status")]
+            if actionable:
+                print(f"{len(actionable)} waiting for {agent}. "
+                      f"Read with: bus.py read {agent}")
+                return 0
+            remaining = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return 1
+            if not listener.wait(remaining):
+                return 0
 
 
 def _utility_command(client, argv):
@@ -467,7 +469,7 @@ def _utility_command(client, argv):
     elif command == "path":
         print(client.path)
     else:
-        print("usage: bus.py agents|watch|path|job [name]|name [handle]|"
+        print("usage: bus.py agents|watch|path|job [name]|name [task]|"
               "send <from> <to> <text>|broadcast <from> <to> <text>|"
               "read <agent>|register <agent>|confirm <agent> <id> yes|no|"
               "wait <agent> [seconds]")
@@ -486,9 +488,11 @@ def _agents_command(client):
     """
     for row in agents(client):
         status = "online" if row["online"] else "offline"
+        handle = row.get("display_handle") or row["handle"]
         print((
-            f'{row['handle']:<14} {row['name']:<8} {status:<9} job='
-            f'{row['job']:<22} unread={row['unread']!s:<3}'
+            f'{handle:<15} {row['name']:<7} {status:<8} task='
+            f'{row.get('task') or '-':<16} job={row['job']:<22} '
+            f'unread={row['unread']!s:<3}'
         ))
     return 0
 
@@ -520,7 +524,8 @@ def _main(argv):
     client = connect()
     command = argv[0] if argv else "agents"
     handlers = {"send": _send_command, "broadcast": _send_command,
-                "name": _name_command, "confirm": _confirm_command,
+                "name": _name_command, "task": _name_command,
+                "confirm": _confirm_command,
                 "wait": _wait_command}
     if command == "agents":
         return _agents_command(client)
@@ -532,23 +537,30 @@ def _main(argv):
 
 
 @context.locked
-def set_name(client, handle):
-    """Publish a task handle and forget approvals tied to an earlier task.
+def set_task(client, task):
+    """Publish what this window is on, and forget approvals for the last.
 
     Args:
-        client (Bus): Connection whose published task changes.
-        handle (str): Requested task handle.
+        client (Bus): Connection whose declared task changes.
+        task (str): The work, e.g. "sso-login".
 
     Returns:
-        str: Published numbered handle.
+        str: The task now published.
     """
-    previous = state.read_handle(client.state, client.session) or ""
-    published = presence.set_name(client, handle)
+    handle = state.read_handle(client.state, client.session) or ""
+    previous = state.task_of(client.state, client.session,
+                             handle.split("-", 1)[0], handle)
+    published = presence.set_task(client, task)
     links = os.path.join(client.state, "project_links.json")
-    if (NAME_NUMBER.sub("", previous) != NAME_NUMBER.sub("", published)
-            and os.path.exists(links)):
+    if previous != published and os.path.exists(links):
         project_confirmation.invalidate_relationships(client)
     return published
+
+
+# The command and MCP tool that set the task are still called "name":
+# every brief and every window's habits say `name`, and the name is what
+# the operator reads the task beside.
+set_name = set_task
 
 
 @context.locked

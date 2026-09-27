@@ -112,7 +112,7 @@ def _context(client, session, agent, handle, job):
     generation = identity.session_generation(session)
     canonical = identity.canonical_session(client, session, generation)
     context = {"session": canonical, "agent": agent, "job": job,
-               "task": routing.task_stem(handle, agent, session)}
+               "task": routing.task_of(client, handle, agent, session)}
     if generation is not None and canonical == session:
         context["session_start"] = generation
     return context
@@ -326,8 +326,8 @@ def _project(client, record):
 
 
 def _probe(client, sender, record, confirmation_id, project):
-    task = routing.task_stem(record.get("from_handle"), sender,
-                             record["from_session"])
+    task = routing.task_of(client, record.get("from_handle"), sender,
+                           record["from_session"])
     description = f" Sender task: {task!r}." if task else ""
     receiver = record.get("to_agent") or record["to"]
     script = shlex.quote(os.path.join(os.path.dirname(__file__), "bus.py"))
@@ -338,10 +338,12 @@ def _probe(client, sender, record, confirmation_id, project):
         f"Are you working on project {project!r}?{description} {asker} "
         "wants to share a message; its contents are withheld until you "
         "explicitly confirm. Reply yes only if this window is working on "
-        f"that project, otherwise no. Confirm with: {command}. To decline, "
-        "replace yes with no. Alternatively use the MCP confirm_project "
-        f"tool with confirmation_id={confirmation_id!r} and accept=true or "
-        "false."
+        f"that project, otherwise no. Confirm with: {command}."
+    )
+    question += (
+        " To decline, replace yes with no. Alternatively use the MCP "
+        f"confirm_project tool with confirmation_id={confirmation_id!r} and "
+        "accept=true or false."
     )
     check = {
         "id": confirmation_id,
@@ -386,8 +388,35 @@ def _request_one(client, sender, record):
             payload["to_session"],
             payload["to_agent"],
             payload.get("to_session_start"))
-    if (project == source_context["job"]
-            and _relationship(client, source_context, target_context)):
+
+    is_confirmed = (project == source_context["job"]
+                    and _relationship(client, source_context, target_context))
+
+    if not is_confirmed:
+        parent_session = identity.get_parent_session(client)
+        if parent_session:
+            parent_rows = []
+            for row in presence.routing_rows(client):
+                session = identity.canonical_session(client, row["session"])
+                if session == parent_session:
+                    parent_rows.append(row)
+            if parent_rows:
+                # A parent might have multiple presence rows; they should be
+                # consistent.
+                parent_agent = parent_rows[0]["agent"]
+                parent_handle = parent_rows[0]["handle"]
+                parent_job = parent_rows[0].get("job")
+                parent_context = _context(
+                    client,
+                    parent_session,
+                    parent_agent,
+                    parent_handle,
+                    parent_job)
+                if project == parent_context.get("job"):
+                    is_confirmed = _relationship(
+                        client, parent_context, target_context)
+
+    if is_confirmed:
         payload["ts"] = time.time()
         if payload["kind"] == "task":
             _task_status(client, payload, "queued")
@@ -475,6 +504,37 @@ def request_confirmation(client, sender, record):
     queued = all(item["status"] == "queued" for item in confirmations)
     result["status"] = "queued" if queued else "awaiting_confirmation"
     return result
+
+
+def confirmed_pairings(bus):
+    """Fetch the set of sessions this window has confirmed projects with."""
+    session = identity.canonical_session(bus, bus.session)
+    path = os.path.join(bus.state, "project_links.json")
+    links = _load_json(path) or {}
+
+    pairings = set()
+    for entry in links.values():
+        if not isinstance(entry, dict):
+            continue
+        contexts = entry.get("contexts", [])
+        if len(contexts) != 2:
+            continue
+
+        is_self_in_pairing = any(
+            identity.canonical_session(
+                bus, c.get("session"), c.get("session_start")
+            ) == session
+            for c in contexts
+        )
+
+        if is_self_in_pairing:
+            for c in contexts:
+                peer_session = identity.canonical_session(
+                    bus, c.get("session"), c.get("session_start")
+                )
+                if peer_session != session:
+                    pairings.add(peer_session)
+    return pairings
 
 
 def _status_notice(client, agent, pending):

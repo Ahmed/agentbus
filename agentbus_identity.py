@@ -2,6 +2,7 @@
 
 import errno
 import fcntl
+import glob
 import json
 import os
 import re
@@ -176,13 +177,13 @@ def bind_session(client, agent):
 
 
 def _migrate_identity(client, key):
-    """Carry names and jobs into the hook's conversation identity.
+    """Carry names, tasks and jobs into the hook's conversation identity.
 
     Args:
         client (Bus): Connection for the canonical conversation.
         key (str): Legacy process identity being merged.
     """
-    for prefix in ("handle", "job"):
+    for prefix in ("handle", "task", "job"):
         old = os.path.join(client.state, f"{prefix}.{key}")
         new = os.path.join(client.state, f"{prefix}.{client.session}")
         if os.path.exists(old) and not os.path.exists(new):
@@ -399,3 +400,77 @@ def session_dead(session, record=None):
         except (TypeError, ValueError):
             return False
     return False
+
+
+def _find_codex_parent_thread_from_fs(thread_id):
+    """Find parent thread for a given codex thread_id from rollout files."""
+    home_dir = os.path.expanduser("~")
+    sessions_dir = os.path.join(home_dir, ".codex", "sessions")
+    if not os.path.isdir(sessions_dir):
+        return None
+
+    pattern = os.path.join(sessions_dir, "*", "*", "*",
+                           f"rollout-*-{thread_id}.jsonl")
+    for filepath in glob.glob(pattern):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                first_line = f.readline()
+                if not first_line:
+                    continue
+                data = json.loads(first_line)
+                payload = data.get("payload", {})
+                if "parent_thread_id" in payload:
+                    return payload["parent_thread_id"]
+                source = (
+                    data.get("source", {})
+                    .get("subagent", {})
+                    .get("thread_spawn", {})
+                )
+                if "parent_thread_id" in source:
+                    return source["parent_thread_id"]
+        except (IOError, OSError, json.JSONDecodeError):
+            continue
+    return None
+
+
+def _find_codex_parent_thread(bus, thread_id):
+    """Find a codex thread's parent from its rollout file, cached."""
+    cache_path = os.path.join(bus.state, f"parent.{thread_id}")
+    try:
+        cached = state_store.read_file(cache_path)
+        if cached is not None:
+            return cached if cached != "null" else None
+    except (IOError, OSError):
+        pass
+
+    parent = _find_codex_parent_thread_from_fs(thread_id)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        f.write(parent or "null")
+    return parent
+
+
+def get_codex_parent(bus, thread_id):
+    """Recursively find the root parent of a codex thread."""
+    parent = _find_codex_parent_thread(bus, thread_id)
+    if not parent:
+        return None
+
+    visited = {thread_id}
+
+    while parent:
+        if parent in visited:
+            return None  # Cycle detected
+        visited.add(parent)
+
+        next_parent = _find_codex_parent_thread(bus, parent)
+        if not next_parent:
+            return parent
+        parent = next_parent
+    return parent
+
+
+def get_parent_session(bus):
+    """Get the parent session for a codex helper."""
+    if os.environ.get("CODEX_THREAD_ID"):
+        return get_codex_parent(bus, bus.session)
+    return None

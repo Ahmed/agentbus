@@ -79,8 +79,10 @@ class TestDelivery(unittest.TestCase):
                    CODEX_THREAD_ID="recipient")
         env.pop("AGENTBUS_SESSION", None)
 
-        name = self._command(env, "name", "codex-delivery")
-        self.assertEqual(self._command(env, "name"), name)
+        shown = self._command(env, "name", "codex-delivery")
+        self.assertEqual(self._command(env, "name"), shown)
+        name, task = shown.split()
+        self.assertEqual(task, "task=delivery")
         message_id = messaging.send_direct(
             self.sender, "claude", name, "routing probe")
         delivered = self.hook("PostToolUse")
@@ -90,6 +92,26 @@ class TestDelivery(unittest.TestCase):
             delivered["hookSpecificOutput"]["additionalContext"])
         self.assertIn(message_id, bus.consumed_ids(self.recipient))
         self.assertEqual(self._command(env, "read", "codex"), "(no messages)")
+
+    def test_a_task_typed_as_the_agent_is_not_a_second_window(self):
+        """Verify codex-<task> in the agent slot still means codex.
+
+        A window told to call itself codex-<task> types that where its
+        CLI name belongs. Taken literally it registered the same window
+        a second time, as a CLI called codex-<task>, and the roster
+        listed it twice.
+        """
+        env = dict(os.environ, AGENTBUS_DIR=self.directory,
+                   CODEX_THREAD_ID="recipient")
+        env.pop("AGENTBUS_SESSION", None)
+        bus.register(self.recipient, "codex")
+        self._command(env, "name", "delivery")
+
+        self._command(env, "read", "codex-delivery")
+
+        state = pathlib.Path(self.recipient.state)
+        self.assertEqual(sorted(path.name for path in state.glob(
+            "presence.*.recipient")), ["presence.codex.recipient"])
 
     @mock.patch.object(identity, "_is_shared_daemon", return_value=False)
     @mock.patch.object(identity, "_parent_of",
@@ -112,7 +134,8 @@ class TestDelivery(unittest.TestCase):
         ):
             legacy = bus.connect(self.directory)
             bus.register(legacy, "claude")
-            name = bus.set_name(legacy, "claude-delivery")
+            bus.set_task(legacy, "delivery")
+            name = bus.current_handle(legacy, "claude")
             bus.set_job(legacy, "delivery-debugging")
             messaging.send_direct(
                 self.sender, "codex", name, "named Claude probe")
@@ -141,7 +164,8 @@ class TestDelivery(unittest.TestCase):
             other = bus.connect(self.directory, session="other-window")
             bus.register(legacy, "claude")
             bus.register(other, "claude")
-            name = bus.set_name(legacy, "claude-existing")
+            bus.set_task(legacy, "existing")
+            name = bus.current_handle(legacy, "claude")
             seen = messaging.send_direct(
                 self.sender,
                 "codex",
@@ -214,7 +238,7 @@ class TestDelivery(unittest.TestCase):
             ):
                 client = bus.connect(self.directory)
                 bus.register(client, "codex")
-                bus.set_name(client, "codex-task")
+                bus.set_task(client, "task")
                 clients.append(client)
         first, second = clients[0], clients[1]
         self.assertNotEqual(bus.current_handle(first, "codex"),
@@ -306,7 +330,8 @@ class TestDelivery(unittest.TestCase):
     def test_named_roster_inbox_uses_recipient_handle(self):
         """Verify named roster inbox uses recipient handle."""
         bus.register(self.recipient, "codex")
-        name = bus.set_name(self.recipient, "codex-recipient")
+        bus.set_task(self.recipient, "recipient")
+        name = bus.current_handle(self.recipient, "codex")
         message_id = messaging.send_direct(
             self.sender, "claude", name, "roster probe")
         waiting = bus.peek(self.sender, "codex", session="recipient")

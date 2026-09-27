@@ -116,7 +116,8 @@ class NotifyWithRedisTests(fixtures.BusFixture):
         listener.start()
         time.sleep(0.5)
 
-        bus.send(self.sender, "codex", "claude-notify-001", "wake up")
+        bus.send(self.sender, "codex",
+                 bus.current_handle(self.target, "claude"), "wake up")
         listener.join(timeout=10)
 
         self.assertFalse(listener.is_alive())
@@ -138,7 +139,8 @@ class NotifyWithRedisTests(fixtures.BusFixture):
             delay (float): Seconds to wait before sending.
         """
         time.sleep(delay)
-        bus.send(self.sender, "codex", "claude-notify-001", "late mail")
+        bus.send(self.sender, "codex",
+                 bus.current_handle(self.target, "claude"), "late mail")
 
     def test_stop_hook_holds_the_turn_open_for_late_mail(self):
         """Mail arriving after a turn ends still reaches that window.
@@ -242,60 +244,109 @@ class FallbackSleepTests(unittest.TestCase):
 
 
 class WindowNameTests(fixtures.BusFixture):
-    """Every window gets a name that says something about its work."""
+    """Every window gets its own name; the task is said beside it."""
 
     TEMP_PREFIX = "agentbus-name-test-"
-    DEFAULT_JOB = "agentbus@numbered-window-names"
+    DEFAULT_JOB = "agentbus@generated-window-names"
 
-    def test_the_branch_is_preferred_over_the_repository(self):
-        """Two windows on one repo are common; one branch is the split."""
-        self.assertEqual(
-            session_hook.name_from_job("claude", "agentbus@my-branch"),
-            "claude-my-branch")
+    def fresh(self, session, agent="claude"):
+        """Register a window that has not declared a task.
 
-    def test_a_job_without_a_branch_uses_the_repository(self):
-        """A bare job name is still better than four hex characters."""
-        self.assertEqual(
-            session_hook.name_from_job("codex", "scratchpad"),
-            "codex-scratchpad")
+        Args:
+            session (str): Session id for the window.
+            agent (str): CLI name it answers to.
 
-    def test_awkward_characters_become_a_usable_name(self):
-        """A branch name is not required to be a legal handle."""
-        self.assertEqual(
-            session_hook.name_from_job("claude", "repo@feature/JIRA-9_x"),
-            "claude-feature-jira-9-x")
-
-    def test_a_long_branch_is_trimmed_to_leave_room_for_a_number(self):
-        """The name must still fit once a three-digit suffix is added."""
-        name = session_hook.name_from_job(
-            "claude", "repo@" + "a-very-long-branch-name" * 3)
-
-        self.assertLessEqual(len(name), bus.NAME_STEM_MAX)
-        self.assertFalse(name.endswith("-"))
-
-    def test_a_job_that_says_nothing_leaves_the_fallback(self):
-        """With no job there is nothing better than the generated handle."""
-        self.assertIsNone(session_hook.name_from_job("claude", ""))
-        self.assertIsNone(session_hook.name_from_job("claude", "unknown"))
-
-    def test_an_unnamed_window_is_named_after_its_job(self):
-        """A window that never named itself still gets a real name."""
-        window = bus.connect(self.directory, session="fresh-session",
-                             cwd=os.path.join(self.directory, "fresh"))
+        Returns:
+            Bus: Connection for that window.
+        """
+        window = bus.connect(self.directory, session=session,
+                             cwd=os.path.join(self.directory, session))
         bus.set_job(window, self.DEFAULT_JOB)
+        bus.register(window, agent)
+        return window
+
+    def test_registering_gives_a_word_name(self):
+        """A new window is claude-<word>, not a hex fragment or a number."""
+        window = self.fresh("fresh-session")
+
+        handle = bus.current_handle(window, "claude")
+
+        self.assertTrue(handle.startswith("claude-"))
+        self.assertIn(handle.split("-", 1)[1], bus.constants.NAME_WORDS)
+        self.assertIsNone(bus.current_task(window, "claude"))
+
+    def test_no_two_windows_share_a_word_whatever_their_cli(self):
+        """claude-otter and codex-otter would be two rows to tell apart."""
+        words = set()
+        for number in range(30):
+            agent = ("claude", "codex")[number % 2]
+            window = self.fresh(f"window-{number}", agent)
+            words.add(bus.current_handle(window, agent).split("-", 1)[1])
+
+        self.assertEqual(len(words), 30)
+
+    def test_every_word_taken_falls_back_to_a_digit(self):
+        """Running out of words is not a reason to share one."""
+        state = bus.connect(self.directory, session="observer").state
+        for number, word in enumerate(bus.constants.NAME_WORDS):
+            path = os.path.join(state, f"handle.taken-{number}")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(f"codex-{word}")
+
+        handle = bus.current_handle(self.fresh("late-window"), "claude")
+
+        self.assertRegex(handle, r"^claude-[a-z]+2$")
+
+    def test_the_name_is_kept_for_life(self):
+        """Declaring or changing the task never renames the window."""
+        window = self.fresh("steady-session")
+        before = bus.current_handle(window, "claude")
+
+        bus.set_task(window, "sso-login")
+        bus.set_task(window, "export-retries")
         bus.register(window, "claude")
 
-        named = session_hook.autoname(window, "claude")
+        self.assertEqual(bus.current_handle(window, "claude"), before)
+        self.assertEqual(bus.current_task(window, "claude"),
+                         "export-retries")
 
-        self.assertTrue(named.startswith("claude-numbered-window-names"))
+    def test_the_old_way_of_typing_a_task_still_means_the_task(self):
+        """claude-sso-login and sso-login-001 are both the task sso-login."""
+        window = self.fresh("habit-session")
 
-    def test_a_window_that_chose_a_name_keeps_it(self):
-        """Naming is a decision, and SessionStart must not overrule it."""
-        window = self.window("chosen-session", "claude", "claude-sso-login")
+        for typed in ("claude-sso-login", "sso-login-001", "SSO-Login"):
+            with self.subTest(typed=typed):
+                self.assertEqual(bus.set_task(window, typed), "sso-login")
 
-        named = session_hook.autoname(window, "claude")
+    def test_a_task_about_reading_mail_is_refused(self):
+        """Every new window reads its mail; that describes none of them."""
+        window = self.window("fresh-codex", "codex", "sso-login")
 
-        self.assertEqual(named, "claude-sso-login-001")
+        for chore in ("codex-inbox", "inbox-check", "read-mail",
+                      "codex-inbox-001", "codex"):
+            with self.subTest(chore=chore):
+                with self.assertRaises(ValueError):
+                    bus.set_task(window, chore)
+
+        self.assertEqual(bus.current_task(window, "codex"), "sso-login")
+
+    def test_a_task_that_mentions_the_inbox_is_still_a_task(self):
+        """Only a task with nothing but bus upkeep in it is refused."""
+        window = self.window("inbox-work", "claude", "sso-login")
+
+        self.assertEqual(bus.set_task(window, "inbox-rendering"),
+                         "inbox-rendering")
+
+    def test_a_numbered_name_from_before_still_says_its_task(self):
+        """A window named the old way keeps routing by that task."""
+        window = self.fresh("legacy-session", "codex")
+        with open(os.path.join(window.state, "handle.legacy-session"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("codex-sso-login-001")
+
+        reopened = bus.connect(self.directory, session="legacy-session")
+
+        self.assertEqual(bus.current_task(reopened, "codex"), "sso-login")
 
 
 class WakeTests(unittest.TestCase):

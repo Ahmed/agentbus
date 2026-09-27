@@ -80,6 +80,9 @@ def format_messages(messages):
     lines = []
     for message in messages:
         sender = message.get("from_handle") or message.get("from", "?")
+        parent_handle = message.get("from_parent_handle")
+        if parent_handle:
+            sender = f"{sender} (helper of {parent_handle})"
         age = max(int(time.time() - message.get("ts", time.time())), 0)
         if message.get("kind") == "ack":
             reply_to = message.get("reply_to", "?")
@@ -164,16 +167,28 @@ def prepare_message(bus, sender, to, text, *args, **kwargs):
             reply_to=options.reply_to,
             task_id=options.task_id if options.kind == "result" else None,
             reply_context=options.reply_context)
-    record = {"id": uuid.uuid4().hex[:12],
-              "ts": time.time(),
-              "from": sender,
-              "kind": options.kind,
-              "text": text,
-              "job": options.job or bus.job,
-              "from_handle": state_store.current_handle(bus,
-                                                        sender),
-              "from_session": bus.session,
-              "requested_to": to}
+    record = {
+        "id": uuid.uuid4().hex[:12],
+        "ts": time.time(),
+        "from": sender,
+        "kind": options.kind,
+        "text": text,
+        "job": options.job or bus.job,
+        "from_handle": state_store.current_handle(bus, sender),
+        "from_session": bus.session,
+        "requested_to": to,
+    }
+
+    parent_session = identity.get_parent_session(bus)
+    if parent_session:
+        parent_rows = []
+        for row in presence.routing_rows(bus):
+            session = identity.canonical_session(bus, row["session"])
+            if session == parent_session:
+                parent_rows.append(row)
+        if parent_rows:
+            record["from_parent_handle"] = parent_rows[0]["handle"]
+
     record.update(route)
     for direction in ("from", "to"):
         generation = identity.session_generation(

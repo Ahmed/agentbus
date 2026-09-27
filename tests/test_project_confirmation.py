@@ -310,14 +310,14 @@ class ProjectConfirmationContextTests(ConfirmationFixture):
                 else:
                     client = self.target
                 agent = "codex" if changed_side == "sender" else "claude"
-                original = bus.current_handle(client, agent)
-                bus.set_name(client, agent + "-different")
+                original = bus.current_task(client, agent)
+                bus.set_task(client, "different")
                 request = self.send(bus.current_handle(self.target, "claude"),
                                     text="changed task content")
                 self.assertEqual(request["status"], "awaiting_confirmation")
                 self.assertNotIn("changed task content", self.log())
                 self.confirm(request, False)
-                bus.set_name(client, original)
+                bus.set_task(client, original)
 
     def test_job_round_trip_on_either_side_requires_new_confirmation(self):
         """Leaving a job and returning does not revive the old agreement."""
@@ -346,19 +346,19 @@ class ProjectConfirmationContextTests(ConfirmationFixture):
                 else:
                     client = self.target
                 agent = "codex" if changed_side == "sender" else "claude"
-                original = bus.current_handle(client, agent)
-                bus.set_name(client, agent + "-temporary-task")
-                bus.set_name(client, original)
+                original = bus.current_task(client, agent)
+                bus.set_task(client, "temporary-task")
+                bus.set_task(client, original)
                 details = "task round trip requires a new yes: " + changed_side
                 request = self.send(text=details)
                 self.assertEqual(request["status"], "awaiting_confirmation")
                 self.assertNotIn(details, self.log())
 
-    def test_number_only_rename_keeps_confirmation(self):
-        """Taking a different number on the same task is the same window."""
+    def test_retyping_the_same_task_keeps_confirmation(self):
+        """The old numbered spelling of the same task is the same task."""
         self.establish()
-        bus.set_name(self.sender, "codex-project-007")
-        bus.set_name(self.target, "claude-project-008")
+        bus.set_task(self.sender, "codex-project-007")
+        bus.set_task(self.target, "claude-project-008")
         request = self.send(text="same project after renumbering")
         self.assertEqual(request["status"], "queued")
         self.assertEqual([item["text"] for item in self.messages(
@@ -368,8 +368,14 @@ class ProjectConfirmationContextTests(ConfirmationFixture):
         """A new session reusing a confirmed handle inherits no agreement."""
         self.establish()
         previous_handle = bus.current_handle(self.target, "claude")
-        bus.set_name(self.target, "claude-previous")
-        replacement = self.window("replacement", "claude", previous_handle)
+        # The confirmed window goes away, which is the only way its name
+        # becomes free for another session to hold.
+        state = pathlib.Path(self.target.state)
+        for leftover in ("presence.claude.target", "handle.target"):
+            (state / leftover).unlink()
+        replacement = fixtures.holding(self.directory, "replacement",
+                                       "claude", previous_handle,
+                                       self.DEFAULT_JOB)
         request = self.send(
             previous_handle,
             text="replacement needs confirmation")
@@ -381,7 +387,7 @@ class ProjectConfirmationContextTests(ConfirmationFixture):
     def test_sender_context_change_expires_existing_check(self):
         """A check already in flight expires when its sender moves."""
         request = self.send()
-        bus.set_name(self.sender, "codex-new-project")
+        bus.set_task(self.sender, "new-project")
         result = self.confirm(request)
         self.assertEqual(result["status"], "expired")
         self.assertEqual(result["reason"], "sender_context_changed")
@@ -394,7 +400,8 @@ class ProjectConfirmationContextTests(ConfirmationFixture):
         self.assertEqual(request["status"], "awaiting_confirmation")
         self.assertNotIn(self.marker, self.log())
         self.assertEqual(self.messages(self.target, "claude"), [])
-        future = self.window("future", "claude", "claude-future-001")
+        future = fixtures.holding(self.directory, "future", "claude",
+                                  "claude-future-001", self.DEFAULT_JOB)
         self.assertEqual([item["kind"] for item in self.messages(
             future, "claude")], ["project_check"])
         self.confirm(request, client=future)

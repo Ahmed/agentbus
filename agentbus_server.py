@@ -96,23 +96,26 @@ def _receive(limit, block_ms):
 
 @mcp.tool()
 async def whoami() -> str:
-    """Report this session's published name, CLI name and job.
+    """Report this session's name, task, CLI name and job.
 
     Returns:
         The handle other agents use to reach this window specifically, the
-        CLI name that selects a related window, and the job it is
-        working on.
+        task it has declared, the CLI name that selects a related window,
+        and the job it is working on.
     """
     bus_handle = await asyncio.to_thread(_client)
-    published = await asyncio.to_thread(
-        lambda: bus.current_handle(bus_handle, _agent_name()))
     name = _agent_name()
-    return (f"Published on the roster as {published!r}. CLI name {name!r}. "
-            f"Job {bus_handle.job!r}.\n"
+    published = await asyncio.to_thread(
+        lambda: bus.ensure_handle(bus_handle, name))
+    task = await asyncio.to_thread(
+        lambda: bus.current_task(bus_handle, name))
+    return (f"Published on the roster as {published!r}, a name the bus "
+            f"gave this window. Task {task or '(none yet)'!r}. CLI name "
+            f"{name!r}. Job {bus_handle.job!r}.\n"
             f"Send to {published!r} to reach this window only. Sending to "
-            f"{name!r} selects one related window using the reply, named "
-            "task or job; ambiguous destinations require a specific "
-            "handle. Name this window after the task it is on with "
+            f"{name!r} selects one related window using the reply, the "
+            "task or the job; ambiguous destinations require a specific "
+            "handle. Once you are given a task, say what it is with "
             "set_name, and change the job with set_job. Before detailed "
             "content is delivered, the recipient confirms the project; "
             "the pair can then continue while its project context stays "
@@ -128,7 +131,8 @@ async def list_agents() -> str:
     and what each is working on. Every session listed is reachable by handle.
 
     Returns:
-        One line per session: name, online/offline, status, job, unread.
+        One line per session: name, CLI, online/offline, task, job,
+            unread.
     """
     bus_handle = await asyncio.to_thread(_client)
     rows = await asyncio.to_thread(lambda: bus.agents(bus_handle))
@@ -138,48 +142,49 @@ async def list_agents() -> str:
     lines = [f"Your job is {bus_handle.job!r}. Every session below is "
              "reachable by handle.",
              "A CLI name selects one related window using the reply, "
-             "named task or job. Recipients confirm the project before "
+             "task or job. Recipients confirm the project before "
              "detailed content is released. Use broadcast_message for a "
              "group.", ""]
     for row in rows:
         mine = "you" if row.get("session") == bus_handle.session else ""
         presence = "online" if row["online"] else "offline"
-        lines.append(f"{mine:<3} {row['handle']:<14} {row['name']:<7} "
-                     f"{presence:<9} job={row['job']:<20} "
-                     f"unread={row['unread']:<3}")
+        lines.append(f"{mine:<3} {row['handle']:<15} {row['name']:<7} "
+                     f"{presence:<8} task={row.get('task') or '-':<16} "
+                     f"job={row['job']:<20} unread={row['unread']:<3}")
     return "\n".join(lines)
 
 
 @mcp.tool()
-async def set_name(handle: str) -> str:
-    """Publish a name for this session on the roster.
+async def set_name(task: str) -> str:
+    """Say what task this window is on, shown beside its name.
 
-    Sending to a CLI name selects one related window. Matching task names
-    help agents find each other: "claude-sso-login-001" can send to "codex"
-    to reach the unique Codex window named for "sso-login". A full handle
-    addresses that window directly. Name yourself after the task you are
-    working on so the roster can guide this routing.
+    The window's name is given by the bus when it starts -- claude-otter,
+    codex-heron -- and never changes, so every window on the roster is
+    told apart by it. The task is what you set here, and it is what
+    related-window routing matches: a claude window on "sso-login"
+    sending to "codex" reaches the codex window on "sso-login".
 
-    A three-digit number is added on the end: ask for "codex-sso-login"
-    and you are published as "codex-sso-login-001", and a second window
-    on the same task becomes "codex-sso-login-002". So the name you want
-    is yours whether or not somebody else is already on the task -- ask
-    for the task, and read back the name you were given.
+    Set it once you have been given work, not before. Reading your mail
+    is not a task; a task made only of words like inbox, mail or check is
+    refused.
 
     Args:
-        handle: Lowercase name for the task, e.g. "codex-sso-login",
-            at most 28 characters. Letters, digits, '-', '_'.
+        task: Two or three words for the work, e.g. "sso-login". Letters,
+            digits, '-', '_'; a leading "codex-" is dropped.
 
     Returns:
-        The handle now published, with its number.
+        This window's name and the task now published.
     """
     try:
+        client = await asyncio.to_thread(_client)
+        published = await asyncio.to_thread(
+            lambda: bus.set_task(client, task))
         name = await asyncio.to_thread(
-            lambda: bus.set_name(_client(), handle))
+            lambda: bus.ensure_handle(client, _agent_name()))
     except ValueError as error:
         return f"Error: {error}"
-    return (f"Published on the roster as {name!r}. Other agents can now "
-            "address this window specifically.")
+    return (f"{name!r} is now on task {published!r}. Related windows on "
+            "the same task can find it by CLI name.")
 
 
 @mcp.tool()
