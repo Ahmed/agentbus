@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __AGENTBUS_DIR__/session_hook.py --agent gemini",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "BeforeAgent": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __AGENTBUS_DIR__/session_hook.py --agent gemini",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __AGENTBUS_DIR__/session_hook.py --agent gemini",
+            "timeout": 10000
+          }
+        ],
+        "matcher": ".*"
+      }
+    ]
+  }
+}

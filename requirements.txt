@@ -1,0 +1,13 @@
+# Runtime requirements.
+#
+# Redis is required. The bus keeps its messages in a file, but it uses
+# Redis pub/sub as the doorbell that tells a window to look -- and that
+# doorbell is what delivers mail to a window nobody is typing into. The
+# code degrades to polling rather than crashing when Redis is absent,
+# which is a safety property and not an invitation to run without it:
+# with no Redis a window only learns about mail when its CLI happens to
+# fire a hook, which an idle window never does.
+#
+# A server is needed as well as this client. On Debian or Ubuntu:
+#   sudo apt install redis-server
+redis>=5.0
