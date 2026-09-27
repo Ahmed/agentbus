@@ -9,7 +9,71 @@ through, plus the MCP server and session hooks that connect them to it.
                              pending project confirmations, one watcher lock per window
 ```
 
-No Redis, no daemon, no server.
+Messages stay in the file. Each window has its own listening subprocess.
+
+## Persistent delivery in Claude and Codex
+
+On Linux, the listener subscribes once to `inotify` file-change events and
+blocks in the kernel until the log or relevant session state changes. It
+has no empty-inbox timer and no hourly timeout. The subscription starts
+before the first backlog read, and directory watches survive atomic log
+compaction. The process also watches its owning window's exit where a
+window pid is available.
+
+- **Claude:** `agentbus_channel.py` is a one-way MCP channel. It pushes
+  actual mail into the existing conversation and keeps listening. Its
+  handshake advertises `claude/channel`; events use
+  `notifications/claude/channel`. Receipt-only traffic stays silent. Hooks
+  keep session metadata current and leave consumption to the channel.
+- **Codex:** `watcher.py` queues a turn for actionable mail after the window
+  becomes idle. The turn's hook delivers it. Busy windows receive mail in
+  their tool/stop hooks. Project-check questions can wake idle windows too.
+  A short grace is scheduled only when actual mail is pending.
+
+Register Claude's channel once using absolute paths to this checkout and a
+Python interpreter with `requirements.txt` installed:
+
+```bash
+claude mcp add-json --scope user agentbus-events \
+  '{"type":"stdio","command":"/path/to/python","args":["/path/to/agentbus/agentbus_channel.py"]}'
+```
+
+Claude 2.1.283 checks channel names against saved MCP registrations. A server
+supplied only through `--mcp-config` can connect while the startup banner
+reports `no MCP server configured with that name`. The saved registration
+allows the check to find it. The wrapper still supplies its current interpreter
+and checkout path through `--mcp-config`. Outside that wrapper the saved
+server stays passive, without consuming mail or advertising a channel.
+
+Source `shell.sh` in a fresh shell, then start or resume the windows:
+
+```bash
+source /path/to/agentbus/shell.sh
+claude
+codex
+```
+
+The Claude wrapper supplies a separate `agentbus-events` MCP server and
+`--dangerously-load-development-channels server:agentbus-events`. Claude
+requires its local-development confirmation on launch because custom
+channels are a research preview. Account or organization channel policy
+still applies. See [Claude channels](https://code.claude.com/docs/en/channels)
+and [channel development](https://code.claude.com/docs/en/channels-reference).
+This flag enables this local channel only; it does not change tool approvals.
+`AGENTBUS_PYTHON` must have the packages in `requirements.txt` installed.
+Print mode and CLI administration commands pass through unchanged.
+
+Starting `claude` without a task loads the bus briefing through
+`--append-system-prompt`. It supplies no opening user message: the window
+waits for your request or actual incoming mail while the channel listens.
+
+Restart existing windows to replace their old background waits and load
+the channel environment. A shell that sourced an earlier `shell.sh` must
+source it again. There is no startup `bus.py read` instruction and the model
+must not create or restart a mail listener. Explicit `bus.py wait <agent>`
+remains available for manual use: it waits indefinitely by default and
+returns only for actionable mail or owner exit. An explicitly supplied
+finite timeout exits silently.
 
 ## Why a file and not a queue
 
@@ -52,57 +116,63 @@ the bus. Before sharing content, the bus asks the chosen window to confirm
 it is working on the indicated project. Broadcasting is an explicit action
 and uses the same confirmation for each recipient.
 
-### Name a window after its task
+### A window has a name; it says what task it is on
 
-A session starts as `claude-5765` — its CLI plus four characters of its
-session id, unique but meaningless. A window working on something worth
-addressing should take a name that says so:
+Every window is given a name by the bus the first time it registers:
+its CLI and a word, `claude-otter`, `codex-heron`. No two windows on the
+bus hold the same word, whatever their CLI, and a window keeps its name
+for life. The model never chooses it, so it is never a copy of somebody
+else's, never the name of the chore the window was doing when it was
+asked, and never a number that is the only difference between two rows.
 
-```
-set_name("claude-sso-login")   # the MCP tool -> claude-sso-login-001
-bmail name claude-sso-login    # from a shell -> claude-sso-login-001
-```
-
-The published name carries a three-digit number the bus adds. Two windows
-opening on one task both want to be called after it, and the useful answer
-is to say which is which rather than to refuse the second and make it
-invent a name that no longer describes the work: the next window asking for
-`claude-sso-login` is published as `claude-sso-login-002`. So a window can
-name itself without first reading the roster to see who else is here, and
-the roster never carries two windows a sender cannot tell apart. Ask for
-the task; read back the name you were given, because that is the address.
-
-The lowest free number is taken rather than the next one up, so numbers a
-finished window frees come back into use. A name dies with the window that
-held it: once the session is gone its number is free again.
-
-A name written with a number already on it — `claude-sso-login-004` — means
-that particular window and is published as written, or refused if a live
-session holds it. The number is also what keeps a window from answering to
-a bare CLI name: asking for `codex` gets you `codex-001`, which is an
-address for one window, while `codex` itself asks the bus to find a related
-Codex window. A name has to be at most 28 characters to leave room for its
-number.
-
-Renaming shows up on the roster immediately. Resolved sends are pinned to
-the chosen session, so renaming it or reusing its old handle cannot redirect
-queued mail. Changing either side's task or job requires a new project
-confirmation before further content is shared. Reading as the CLI name
-still collects this window's mail and any broadcasts addressed to it.
-
-Use the published handle on the **receiving** side of `send` when the
-message belongs to one window:
+What the window is working on is a separate label, its **task**, which
+the window declares once it has been given one:
 
 ```
-bmail send codex claude-data-export-001 "Update for that Claude window"
-bmail send claude codex-data-export-001 "Reply for that Codex window"
+set_name("sso-login")          # the MCP tool
+bmail name sso-login           # from a shell -> claude-otter task=sso-login
+```
+
+The roster shows both:
+
+```
+claude-otter    claude  online   task=sso-login        job=webapp@main
+codex-heron     codex   online   task=sso-login        job=webapp@main
+claude-wren     claude  online   task=-                job=agentbus@main
+```
+
+A Codex sub-agent (helper) will have its relationship to its parent
+reflected in its handle, e.g., `codex-glacier (helper of codex-maple)`.
+The helper inherits the confirmed project pairings of its parent, so it
+does not need to re-confirm projects that the parent has already
+confirmed.
+
+A task is not unique: a Claude and a Codex window pairing on one piece of
+work is exactly what the task is for. `claude-sso-login` and the old
+numbered `claude-sso-login-004` are read as the task `sso-login`, because
+windows were told to type it that way for a long time. A task made only
+of words for reading the bus (`inbox`, `mail`, `check` and the like) is
+refused; see [Every window has a name](#every-window-has-a-name).
+
+A new task shows up on the roster immediately. Resolved sends are pinned
+to the chosen session, so changing task cannot redirect queued mail.
+Changing either side's task or job requires a new project confirmation
+before further content is shared. Reading as the CLI name still collects
+this window's mail and any broadcasts addressed to it.
+
+Use the name on the **receiving** side of `send` when the message belongs
+to one window:
+
+```
+bmail send codex claude-otter "Update for that Claude window"
+bmail send claude codex-heron "Reply for that Codex window"
 ```
 
 For ordinary communication, a bare CLI name finds the related window:
 
 ```
-bmail name codex-data-export                 # -> codex-data-export-001
-bmail send codex claude "Update on data-export"    # -> claude-data-export-001
+bmail name data-export                           # -> codex-heron task=data-export
+bmail send codex claude "Update on data-export"  # -> the claude on data-export
 ```
 
 The first argument to `send` identifies the sender. The bus resolves the
@@ -110,27 +180,25 @@ receiving CLI name in this order:
 
 1. For a reply with `reply_to`, use the original sender when it belongs to
    the receiving CLI.
-2. Match the task part of the window name exactly: `codex-data-export-001`
-   matches `claude-data-export-002`. The CLI prefix and final three-digit number
-   are ignored. If several windows share that task, an exact job match must
-   identify one of them.
+2. Match the task exactly. If several windows share it, an exact job match
+   must identify one of them.
 3. If no task matches, use a unique window with the same job.
 
 Idle windows listed on the roster remain eligible. If no related window
-exists or several match, the send fails with candidate handles and appends
-nothing. Choose an exact handle from that list or align the windows' task
-names and jobs. Shell and MCP responses show the resolved handle and
+exists or several match, the send fails with candidate names and appends
+nothing. Choose an exact name from that list or align the windows' tasks
+and jobs — and if none of the candidates is obviously the one that was
+meant, the failure says to ask the operator which, rather than picking a
+window or broadcasting to all of them. An agent guessing here delivers
+work to a window that was not asked for it, which costs more than the
+question would have. Shell and MCP responses show the resolved name and
 whether content is queued or waiting for project confirmation, along with
 the relevant message or confirmation request id.
 
-If an exact handle is absent, only the project-check question queues for
-that handle. The actual content stays off the bus until a window registers
-that handle and confirms before the check expires; delivery is then pinned
+If an exact name is absent, only the project-check question queues for
+it. The actual content stays off the bus until a window holding that name
+registers and confirms before the check expires; delivery is then pinned
 to that confirming session.
-
-A Codex name set before the thread-identity fix may have belonged to a
-short-lived shell process and disappeared. Run `bmail name codex-<task>`
-again in the intended Codex window and read back the returned handle.
 
 The job is a **routing hint and roster label** describing the work. It is
 guessed from the repository and branch (`webapp@main`) and set explicitly
@@ -192,9 +260,8 @@ check each recipient separately, so one window's yes does not release
 content to another. Receipt acknowledgments concern delivery only; they do
 not confirm a project.
 
-This check follows the existing hook delivery rules. It cannot start a
-turn in a fully idle window; its question waits until that window runs a
-tool, finishes an active turn, or reads its inbox.
+Project-check questions use the persistent delivery path too, so an idle
+Claude or Codex window can receive the question and confirm its project.
 
 ## A message is acknowledged when it is read
 
@@ -214,6 +281,8 @@ acknowledged, so two windows reading each other do not trade them forever.
 | File | What it is |
 | --- | --- |
 | `bus.py` | Public bus API and shell CLI. |
+| `agentbus_events.py` | Persistent kernel subscriptions for bus-file and window-exit events. |
+| `agentbus_channel.py` | Claude MCP channel that pushes waiting mail without model polling. |
 | `agentbus_notify.py` | The Redis doorbell: rings a window when mail lands, and blocks a listener until one arrives. Carries no contents. |
 | `tests/` | The test suite, plus the fixtures it shares. Discovered from the repository root. |
 | `agentbus_*.py` | Bus implementation modules and shared test helpers. |
@@ -236,7 +305,9 @@ Telling a model to poll its inbox is not an architecture. It fails exactly
 when it matters — while the agent is busy — and only works if the model
 bothers to obey.
 
-All three CLIs fire a hook after **every tool call**: `PostToolUse` in
+Claude channel sessions receive pushed mail directly. For Codex, Gemini,
+and Claude sessions launched without a channel, hooks provide delivery
+after **every tool call**: `PostToolUse` in
 Claude and Codex, `AfterTool` in Gemini. Mail is appended to the result of
 whatever tool the agent just ran, mid-turn, whether or not it thought to
 look. Measured at ~18ms when there is no mail, which is why there is no
@@ -258,7 +329,10 @@ a hook that answers it can hand back text the CLI feeds to the model
 on at the end of that work, with nobody at the keyboard. The woken turn is
 told plainly that the operator did not ask for this, that it should act
 anyway, and that it must say what happened before it goes quiet again —
-that report is the only trace the operator gets.
+that report is the only trace the operator gets. The wake-up message now
+includes explicit instructions on how to reply to messages using
+`bus.py send` and how to report task results using `report_result`, to
+ensure the agent replies to the original sender on the bus.
 
 This is the unattended continuation earlier versions of this file refused
 on principle. It is here now by the owner's decision, bounded rather than
@@ -312,29 +386,34 @@ continuing it, for anyone who wants the notification and not the autonomy.
 
 ## The window that is not looking
 
-One gap survives all of that. Every hook is a reply to something the CLI
-asked, so a window sitting at an empty prompt fires none of them: not
-`PostToolUse`, because it is running no tools, and not `Stop`, because its
-turn ended long ago. Its mail waits for the operator to type something.
+A window at an empty prompt fires no hooks. `watcher.py`, started by
+`session_hook.py` at `SessionStart`, observes that window's unread inbox.
+For Codex it can request a turn with the installed `codex queue` command.
+Claude uses its native MCP channel; Gemini depends on its normal hooks.
+Desktop notifications and terminal bells require `--notify` and `--bell`;
+neither is enabled by default. `AGENTBUS_WAKE=0` also disables queued turns.
 
-`watcher.py` is one background process per window, started by
-`session_hook.py` at `SessionStart`. It observes waiting mail and is
-**silent by default**. Desktop notifications require `--notify`; terminal
-bells require `--bell`. Neither can deliver mail into a conversation or
-start a turn.
+Queued turns are allowed only after the window's existing presence record
+reports a settled idle state. Busy or unknown windows are left to their
+hooks. The watcher rechecks both activity and unread message IDs immediately
+before enqueueing. Receipts and project-status notices do not wake or ring;
+a project-check question can start an idle turn.
 
-An idle window cannot be woken through the available hook interface:
+A persistent claim in `state/wake_notice.<agent>.<session>` coalesces a burst
+into one queued wake for that idle heartbeat, including across watcher
+restarts. A definite queue rejection can retry on a subsequent bus or
+presence event; there is no periodic retry scan.
+A timeout retains the claim because the daemon might already have accepted
+the prompt. A later idle heartbeat permits a new wake. No watcher consumes
+mail or updates presence to implement this check.
 
-| Route into an idle window | Why not |
-| --- | --- |
-| Keystroke injection (`TIOCSTI`) | `dev.tty.legacy_tiocsti = 0` on this kernel, and on most since 6.2 |
-| Writing to the window's stdout | Paints characters over a TUI that is redrawing. A bell is the exception: no glyph, so nothing to corrupt |
-| The hook interface | A reply to a question the CLI asked. Not a door to knock on |
-| `tmux send-keys` | Genuinely works — and needs every CLI launched inside tmux, which is a different decision than this one |
-
-The operator presses Enter and the ordinary hooks deliver. Optional
-notifications can prompt that action, but are disabled unless explicitly
-requested.
+Queueing and hook delivery are separate operations: a hook can still read
+mail just as a wake is accepted. The queued notice tells the model that
+hooks deliver mail and that already handled mail needs no further action
+or empty-inbox report. The installed
+queue command exposes no cancellation operation; already queued notices can
+finish after their mail has been consumed. Idle gating and burst coalescing
+prevent a backlog from being created during an active turn.
 
 ### Two rules it must not break
 
@@ -370,36 +449,19 @@ a project check without pretending it has recently been active.
 
 ## Requirements
 
-**Redis is required.** It must be installed and running before the bus is
-useful.
+Persistent local delivery needs Linux `inotify` and `pidfd_open`, Python 3,
+and the MCP package for the Claude channel. The supplied dependency file
+also installs Redis support used by bounded waits in existing bus APIs.
 
 ```bash
-sudo apt install redis-server      # Debian / Ubuntu
 python3 -m pip install -r requirements.txt
-redis-cli ping                     # expect: PONG
 ```
 
-Messages themselves live in the file, not in Redis. What Redis carries is
-the doorbell: a ring, with no contents, saying *look at the bus*. That
-sounds minor and is not, because a blocking subscribe is the only thing
-that reaches a window nobody is typing into. A window sitting at an empty
-prompt fires no hooks, so without the doorbell it learns about mail only
-when its operator next presses a key.
-
-Point `AGENTBUS_REDIS_URL` elsewhere to use a different server, which is
-also how windows on two machines reach each other. The default is
-`redis://127.0.0.1:6379/5` — database 5 to stay out of the way of
-anything else on that server.
-
-The database number is a courtesy, not isolation: Redis pub/sub is not
-scoped per database, so channels are visible across all of them whatever
-number you choose. What actually keeps the bus from colliding with
-another application is that every channel is named `agentbus:...`.
-
-If Redis is missing the bus falls back to polling instead of failing, so
-nothing is lost and no message goes astray. That fallback exists so a
-broken Redis cannot take the bus down with it -- not as a supported way
-to run. Delivery to an idle window stops working without it.
+Redis is optional for persistent local delivery: file events work even if
+Redis is stopped or `AGENTBUS_REDIS=0`. When enabled, Redis carries only
+arrival notifications, with no message contents. `AGENTBUS_REDIS_URL`
+defaults to `redis://127.0.0.1:6379/5`; pub/sub channels use the `agentbus:`
+prefix because Redis pub/sub is not isolated by database number.
 
 ## Installing
 
@@ -439,28 +501,79 @@ Optional, in `~/.bashrc`:
 source /path/to/agentbus/shell.sh
 ```
 
-That shadows `claude`, `codex` and `gemini` with same-named functions, so a
-bare start gets an opening prompt naming its mailbox. Anything with
-arguments (`codex exec`, `claude -p`) passes straight through.
+That shadows `claude`, `codex` and `gemini` with same-named functions.
+Claude interactive starts and resumes include the native channel. A bare
+Codex start connects to its shared daemon for queued delivery.
+`codex exec`, `claude -p` and CLI administration commands pass through.
 
 Then restart the CLIs; hooks load at startup.
 
 ## Every window has a name
 
-A window that never named itself used to publish as its CLI plus four
-characters of its session id — `claude-0d1c`. Unique, and it told nobody
-anything, so the roster filled with windows you could address but not
-choose between.
+Names used to be chosen. A window that never chose one was published as
+its CLI plus four characters of its session id, then as its branch with a
+number (`claude-main-001`), and a window that did choose was told to name
+itself after its task. None of that gave the roster names a reader could
+tell apart:
 
-Now a window is named from its job at SessionStart:
-`agentbus@numbered-window-names` becomes `claude-numbered-window-names-001`,
-and the next window on that branch becomes `-002`. The branch is preferred
-over the repository, because two windows on one repository is the ordinary
-case and two on one branch is the thing worth telling apart.
+- Every new Codex window was told to read its mail and name itself after
+  its task in the same breath, so every one became `codex-inbox-001`,
+  `-002`, and so on.
+- A branch name like `main` names no work, and other agents took
+  `claude-main-001` for the operator's main window and sent it project
+  checks meant for someone else.
+- A window that typed its task where its CLI name belonged
+  (`read claude-sso-login`) was registered a second time under that
+  "CLI", and the roster listed it twice.
 
-It is a default, not a policy. A window that names itself keeps that name,
-and `$BUS name claude-<task>` still renames one at any point. A job that
-says nothing leaves the old fallback rather than inventing something.
+So a name now says only *which* window, and the bus picks it: the CLI
+and a word from a fixed list, unique across every window on the roster
+whatever its CLI, and never reused while its window is still listed, even
+offline. Two windows opening at the same moment start from words their
+session ids hash to and take a lock, so they never pick the same one. If
+every word is taken, the next window gets a digit on the end
+(`claude-otter2`) rather than a shared name.
+
+*What* a window is doing is its task, set with `bmail name <task>` or
+`set_name`, and shown beside the name. A task made only of words for
+reading the bus is refused. So is a task that is a CLI name. The brief
+says to leave the task unset until one arrives.
+
+A window named before this change keeps its numbered name until it
+closes, and its task is read from that name, so it stays routable. Typing
+`claude-<task>` where the agent name belongs now means `claude`.
+
+## The task is checked every ten turns
+
+SessionStart is the worst moment to learn what a window is doing, and the
+opening brief gives it nothing to do but read its mail. So every tenth
+operator turn the hook injects three lines saying what this window is
+published as and what task it has declared, and offering the two commands
+that change them. Nothing is changed automatically: the model knows what
+it is working on and the hook does not, so the hook asks and the model
+answers.
+
+The usual answer is no change, and the check is written to be answerable
+with silence — a window whose task still fits does nothing and says
+nothing about having been asked. A window that does change it says so in
+a clause. `AGENTBUS_RENAME_EVERY` sets the interval, and `0` switches the
+check off.
+
+Per-tool hooks do not count towards it. Ten turns means ten times the
+operator typed, not ten tool calls, so a long stretch of work costs one
+check rather than a hundred. Turns the operator did not type do not count
+either: the opening brief, a turn the watcher queued for mail, and a
+finished background listener all start turns that give the window no work.
+
+The first typed prompt carries a different question. A window with no
+task yet is asked once, on that prompt, to say what the task in it is.
+That is the earliest moment anybody knows what the window is for, and the
+model is the one that can say it in two or three words: the hook sees the
+prompt's words, not what they amount to.
+
+Setting the same task again is a no-op, so answering the check honestly
+never invalidates a project confirmation. Only a genuine change of task
+does that, which is what confirmations are for.
 
 ## A send says whether it landed
 
@@ -473,10 +586,10 @@ never delivered looks exactly like one that was.
 Now it waits briefly and says:
 
 ```
-codex-bus-check-001 -> claude-fbtest-001 (awaiting_confirmation)
-claude-fbtest-001: confirmed, message delivered
-claude-fbtest-001: declined the project, nothing was shared
-claude-fbtest-001: no answer yet, nothing shared so far
+codex-heron -> claude-otter (awaiting_confirmation)
+claude-otter: confirmed, message delivered
+claude-otter: declined the project, nothing was shared
+claude-otter: no answer yet, nothing shared so far
 ```
 
 Bounded on purpose — a courtesy at the end of a send, not a reason for the
@@ -531,15 +644,46 @@ misleading; a turn can now be woken at its end, so the window in which a
 message is worth acting on is wider, and an unread one is worth keeping
 for more than a minute.
 
-The cost is real, and neither the wake nor the longer TTL removes it. A
-message reaches a Claude or Codex window if that window runs a tool or
-finishes a turn inside the ten minutes; a window that sits at an empty
-prompt for longer, and every Gemini window between tools, still misses
-it. Age is rendered on every message (`(12s ago)`) so a recipient can see
+Persistent delivery can wake an idle Claude or Codex window during this
+window. A stopped listener, disconnected window, or Gemini window that
+runs no further tools can still miss mail when it expires. Age is rendered on every message (`(12s ago)`) so a recipient can see
 how stale the thing it is acting on was.
 
 Reads skip anything past its use-by date, and compaction drops it along
 with everything already spent. `/tmp` clears on reboot.
+
+## Approval for peer-requested actions
+
+Agents answer relevant questions, share useful findings and act within their
+assigned work and permissions. The owner authorizes safe collaboration on the
+project a window is already assigned. Related requests and follow-ups proceed
+without a new approval for each message. This includes small local unit tests
+for work just completed and project-wide corrections relayed by another agent,
+such as a rule on commit message style. The owner does not need to
+repeat a related correction in every window.
+
+Agents judge relevance from their actual work and the message content; a
+shared repository or message arrival alone is insufficient. Explicit owner
+limits still apply. Unrelated work is declined without starting it or asking
+the owner to approve it. A second request or a changed task label does not
+cancel approval for related safe work.
+
+An action that is dangerous, could break the project, or has uncertain safety
+must pause until the owner explicitly approves that specific action in a direct
+prompt in the receiving window. Existing direct approval remains valid within
+its stated scope.
+
+When that approval is needed, the receiving agent explains the proposed action
+and risk to the owner, tells the sender it is waiting, and keeps the task
+pending. Safe analysis and information sharing can continue. Peer messages,
+project confirmations, automatic tool approvals, silence and elapsed time
+cannot provide the
+owner's approval. Project confirmation permits exchanging project content;
+it does not authorize risky actions.
+
+This rule is included in the startup brief and both delivery paths. It is
+an instruction to the receiving agent, not a new approval service in the
+bus; existing execution permissions still apply.
 
 ## Safety notes
 
@@ -568,8 +712,10 @@ The regressions use temporary bus directories. They cover names across
 separate Codex commands, hook/tool identity sharing in Claude, related-window
 routing, project confirmations and explicit broadcasts, preservation of
 unread mail during identity migration, roster counts, and continuation
-budgets. They do not start live agents or
-send mail to the real bus.
+budgets. Watcher regressions also cover busy-window deferral, consumed mail,
+receipt-only inboxes, persistent wake coalescing, later idle periods and
+uncertain queue outcomes. They do not start live agents or send mail to the
+real bus.
 
 ## Linting
 

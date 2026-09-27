@@ -61,18 +61,32 @@ def current_handle(bus, agent):
             or default_handle(agent, bus.session))
 
 
-def republish_handle(bus, handle):
-    """Write a new name into this session's presence rows at once.
+def current_task(bus, agent):
+    """What this session says it is working on.
 
-    The roster reads the name out of the presence file, which is only
-    rewritten on the next heartbeat. Without this, a window that has
-    just renamed itself still shows its old name to everyone deciding
-    whom to write to -- including the next window checking whether the
-    name is free.
+    Args:
+        bus (Bus): Bus from connect().
+        agent (str): The CLI name, for reading a pre-generation name.
+
+    Returns:
+        str or None: The task, or None before the window has said.
+    """
+    return task_of(bus.state, bus.session, agent, current_handle(bus, agent))
+
+
+def republish(bus, field, value):
+    """Write a new name or task into this session's presence rows at once.
+
+    The roster reads both out of the presence file, which is only
+    rewritten on the next heartbeat. Without this, a window that has just
+    been named, or has just said what it is working on, still shows the
+    old value to everyone deciding whom to write to -- including the next
+    window checking which names are free.
 
     Args:
         bus (Bus): Connection whose shared bus state is used.
-        handle (str): Published window name.
+        field (str): "handle" or "task".
+        value (str): The new value.
     """
     tail = "." + bus.session
     for name in os.listdir(bus.state):
@@ -84,11 +98,52 @@ def republish_handle(bus, handle):
                 record = json.load(source)
         except (IOError, OSError, ValueError):
             continue
-        record["handle"] = handle
+        record[field] = value
         temporary = f'{path!s}.{os.getpid():d}.tmp'
         with open(temporary, "w", encoding="utf-8") as target:
             json.dump(record, target)
         os.replace(temporary, path)
+
+
+def task_path(state, session):
+    """Where a session's declared task is remembered.
+
+    Args:
+        state (str): Directory containing per-window state files.
+        session (str or None): Conversation identity.
+
+    Returns:
+        str: Path of the task file.
+    """
+    return os.path.join(state, f'task.{session!s}')
+
+
+def task_of(state, session, agent, handle):
+    """What a window says it is working on, or None if it has not said.
+
+    A window named before names were generated carried its task inside
+    the name -- codex-sso-001 -- and keeps that name until it closes, so
+    such a name still counts as saying the task. A generated name never
+    ends in a number, so it is never mistaken for one.
+
+    Args:
+        state (str): Directory containing per-window state files.
+        session (str or None): The window's conversation identity.
+        agent (str): The window's CLI name.
+        handle (str or None): The window's published name.
+
+    Returns:
+        str or None: The task.
+    """
+    declared = read_file(task_path(state, session))
+    if declared:
+        return declared
+    if not handle or not constants.NAME_NUMBER.search(handle):
+        return None
+    stem = constants.NAME_NUMBER.sub("", handle)
+    if stem.startswith(agent + "-"):
+        stem = stem[len(agent) + 1:]
+    return stem if stem and stem != agent else None
 
 
 def job_path(state, session):

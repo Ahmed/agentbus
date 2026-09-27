@@ -59,17 +59,44 @@ BROADCAST_JOB = "*"
 # restricted rather than escaped.
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
-# The number on the end of a published name. A caller that wrote one
-# itself means that particular window and is taken at its word.
+# The number on the end of a name from before names were generated
+# (codex-sso-001). Still recognised, so a window that took one before this
+# version keeps its task until it closes.
 NAME_NUMBER = re.compile(r"-[0-9]{3}$")
 
-# One past the highest number a name can carry. Three digits is more
-# windows than a task will ever have open and stays readable.
-NAME_NUMBER_LIMIT = 1000
+# What a window is called, as opposed to what it is doing. Every window is
+# given one of these when it first registers -- claude-otter, codex-heron
+# -- and keeps it for life. It is never chosen by the model and never
+# shared: no two windows on the bus hold the same word, whatever their
+# CLI, so the roster never shows two rows a reader has to tell apart by a
+# number. The task a window is on is a separate label beside it.
+#
+# Short, unlike each other, and unlike anything a task would be called.
+NAME_WORDS = (
+    "acacia", "agate", "alder", "amber", "aspen", "badger", "baobab",
+    "basalt", "beaver", "beryl", "birch", "bison", "bobcat", "brook",
+    "camel", "canyon", "cedar", "coyote", "crane", "cypress", "dove",
+    "dune", "egret", "elk", "ferret", "finch", "fir", "fjord", "fox",
+    "garnet", "gazelle", "gecko", "geyser", "glacier", "granite", "grove",
+    "hare", "hawk", "hazel", "hemlock", "heron", "ibex", "ibis", "jaguar",
+    "jay", "juniper", "koala", "lagoon", "larch", "lark", "laurel",
+    "lemur", "linden", "lynx", "magpie", "maple", "marble", "marsh",
+    "marten", "meadow", "meerkat", "mesa", "mica", "mink", "moose",
+    "narwhal", "newt", "oak", "ocelot", "okapi", "onyx", "orca", "osprey",
+    "otter", "owl", "plover", "poplar", "possum", "prairie", "puffin",
+    "puma", "quartz", "raccoon", "reef", "ridge", "robin", "rowan",
+    "seal", "sequoia", "shrew", "spruce", "stoat", "stork", "tapir",
+    "tern", "toad", "topaz", "tundra", "valley", "vole", "walrus",
+    "willow", "wolf", "wombat", "wren", "yak", "yew", "zebra",
+)
 
-# The longest name that still leaves room for "-999" inside the 32
-# characters NAME_PATTERN allows.
-NAME_STEM_MAX = 28
+# Words for reading the bus rather than for any piece of work. A new
+# window is told to check its mail before it has been given anything else
+# to do, and left to itself calls its task that -- so every fresh window
+# was on "inbox" and the roster could not tell them apart. A task made
+# only of these says nothing, and is refused.
+CHORE_WORDS = frozenset(("inbox", "mail", "mailbox", "message", "messages",
+                         "bus", "agentbus", "check", "read", "wait"))
 
 # The CLIs a hook or MCP server can be running underneath. Finding one of
 # these among our ancestors is what identifies the window we belong to.

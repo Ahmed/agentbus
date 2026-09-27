@@ -1,124 +1,171 @@
 """Track window presence so names and recipient choices stay unambiguous."""
 
+import fcntl
+import itertools
 import json
 import os
+import re
 import socket
 import time
+import zlib
 
 import agentbus_constants as constants
 import agentbus_identity as identity
 import agentbus_state as state
 
 
-def _name_conflict(bus, handle):
-    """Say why a name cannot be taken, or None if it is free.
+def _held_words(bus):
+    """Words already standing for some other window.
 
-    Two windows answering to one name is worse than no name at all:
-    delivery matches on the handle, so both would receive mail meant for
-    one of them, and the roster would offer the sender no way to tell
-    them apart. A name a dead session left behind is free -- only live
-    windows hold one.
-
-    Args:
-        bus (Bus): Bus from connect().
-        handle (str): The name being claimed.
-
-    Returns:
-        A sentence naming the holder, or None.
-    """
-    for row in roster(bus):
-        if handle == row["name"]:
-            return (f"{handle!r} is the CLI address for every {row['name']} "
-                    "window; mail sent to it reaches all of them")
-        if not row["online"] or row.get("session") == bus.session:
-            continue
-        if handle == row["handle"]:
-            return (f"{handle!r} is already published by a live session "
-                    f"working on {row.get('job', '?')}")
-    return None
-
-
-def _number_name(bus, stem):
-    """Return the stem with the lowest free three-digit number on it.
-
-    Two windows opened on one task both want to be called after it, and
-    the useful answer is to say which is which rather than to refuse the
-    second and make it invent a name that no longer describes the work.
-    claude-sso-001 and claude-sso-002 are two addresses for one
-    task, which is what the roster is being asked to show.
-
-    The lowest free number is taken rather than the next one up, so the
-    numbers a finished window frees come back into use and a task that
-    runs all day does not count off into the hundreds.
+    A name stays held while its window is on the roster at all, online or
+    not, and for a window that has registered but not yet written a
+    heartbeat. Handing a quiet window's name to a newcomer would send
+    the newcomer mail meant for the window that went quiet.
 
     Args:
         bus (Bus): Bus from connect().
-        stem (str): The name without a number, already checked.
 
     Returns:
-        The numbered name.
-
-    Raises:
-        ValueError: Every number is held by a live session.
+        set[str]: The word part of every other window's handle.
     """
-    for number in range(1, constants.NAME_NUMBER_LIMIT):
-        candidate = f'{stem!s}-{number:03d}'
-        if _name_conflict(bus, candidate) is None:
-            return candidate
-    raise ValueError(
-        (
-            f'{
-                stem!r} already has {
-                constants.NAME_NUMBER_LIMIT -
-                1:d} live ' f'windows on it -- that is not a naming problem'
-        ))
+    held = set()
+    handles = [row["handle"] for row in routing_rows(bus)
+               if row["session"] != bus.session]
+    for name in os.listdir(bus.state):
+        if name.startswith("handle.") and name != f"handle.{bus.session}":
+            handles.append(state.read_file(os.path.join(bus.state, name)))
+    for handle in handles:
+        if handle and "-" in handle:
+            held.add(handle.split("-", 1)[1])
+    return held
 
 
-def set_name(bus, handle):
-    """Publish a name for this session on the roster.
+def _pick_word(bus):
+    """The first free word, starting from one this session hashes to.
 
-    Addressing an agent by CLI name reaches every window running it,
-    which is right for "any codex will do" and wrong for "the codex that
-    is already looking at this file". A handle makes the second possible,
-    so it is worth naming a window after the task it is on.
-
-    The name is published with a three-digit number on the end:
-    "codex-sso" becomes "codex-sso-001", and the next window on the same
-    task becomes "codex-sso-002". Naming is then something a window can
-    do without first looking to see who else is here, and the roster
-    never carries two windows the sender cannot tell apart. A handle
-    that already ends in a number is taken as meaning that particular
-    window and is published as written, or refused if it is held.
+    Starting from the session rather than the top of the list keeps two
+    windows opened at once from racing for the same first word, and a
+    lock makes sure that when they do, only one of them wins it.
 
     Args:
         bus (Bus): Bus from connect().
-        handle (str): The name to publish, e.g. "codex-sso".
 
     Returns:
-        The handle now in effect, numbered.
-
-    Raises:
-        ValueError: The name is malformed, too long to carry a number,
-            or -- when it was written with one -- already answered to by
-            another live session or a CLI.
+        str: A word no other window holds, with a digit on the end only
+            once every plain word is taken.
     """
-    state.check_name(handle)
-    if constants.NAME_NUMBER.search(handle):
-        conflict = _name_conflict(bus, handle)
-        if conflict:
-            raise ValueError(f"{conflict} -- pick another")
-    else:
-        if len(handle) > constants.NAME_STEM_MAX:
-            raise ValueError(
-                f"{handle!r} leaves no room for the number on the end: use at "
-                f"most {constants.NAME_STEM_MAX} characters")
-        handle = _number_name(bus, handle)
-    path = state.handle_path(bus.state, bus.session)
-    with open(path, "w", encoding="utf-8") as target:
-        target.write(handle)
+    words = constants.NAME_WORDS
+    start = zlib.crc32(bus.session.encode()) % len(words)
+    held = _held_words(bus)
+    for suffix in itertools.chain([""], (str(n) for n in itertools.count(2))):
+        for offset in range(len(words)):
+            word = words[(start + offset) % len(words)] + suffix
+            if word not in held:
+                return word
+    raise AssertionError("unreachable: the suffixes never run out")
+
+
+def ensure_handle(bus, agent):
+    """Give this window its own name, once, the first time it registers.
+
+    Args:
+        bus (Bus): Bus from connect().
+        agent (str): CLI name, which leads the generated name.
+
+    Returns:
+        str: The handle this window is published as, for life.
+    """
+    existing = state.read_handle(bus.state, bus.session)
+    if existing:
+        return existing
+    with open(os.path.join(bus.state, "names.lock"), "a",
+              encoding="utf-8") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        existing = state.read_handle(bus.state, bus.session)
+        if existing:
+            return existing
+        handle = f"{agent}-{_pick_word(bus)}"
+        path = state.handle_path(bus.state, bus.session)
+        temporary = f"{path}.{os.getpid()}.tmp"
+        with open(temporary, "w", encoding="utf-8") as target:
+            target.write(handle)
+        os.replace(temporary, path)
     bus.handle = handle
-    state.republish_handle(bus, handle)
+    state.republish(bus, "handle", handle)
     return handle
+
+
+def names_a_chore(task):
+    """Whether a task describes reading the bus instead of any work.
+
+    Args:
+        task (str): The task, with or without a CLI prefix or number.
+
+    Returns:
+        bool: True when every word in it is bus upkeep.
+    """
+    words = [word for word in re.split(r"[-_]", normalise_task(task))
+             if word]
+    return bool(words) and all(word in constants.CHORE_WORDS
+                               for word in words)
+
+
+def normalise_task(task):
+    """Reduce what a window typed to the task itself.
+
+    Windows were told for months to name themselves claude-<task>, and
+    some will keep typing it that way, or with a number from the old
+    scheme. Both are the same task as the bare word.
+
+    Args:
+        task (str): The task as typed.
+
+    Returns:
+        str: The task without a CLI prefix or trailing number.
+    """
+    task = constants.NAME_NUMBER.sub("", (task or "").strip().lower())
+    for agent in constants.AGENT_NAMES:
+        if task.startswith(agent + "-"):
+            return task[len(agent) + 1:]
+    return task
+
+
+def set_task(bus, task):
+    """Say what this window is working on, beside its name.
+
+    The name identifies the window and never changes; the task describes
+    it and changes with the work. Two windows on one task is ordinary --
+    a claude and a codex pairing on it is what related-window routing is
+    for -- so a task is not unique, and nothing is numbered.
+
+    Args:
+        bus (Bus): Bus from connect().
+        task (str): The work, e.g. "sso-login". A leading "claude-" or a
+            trailing "-001" from the old naming scheme is dropped.
+
+    Returns:
+        str: The task now published.
+
+    Raises:
+        ValueError: The task is malformed, names a CLI, or only
+            describes checking the bus.
+    """
+    task = normalise_task(task)
+    state.check_name(task)
+    if task in constants.AGENT_NAMES:
+        raise ValueError(f"{task!r} is a CLI, not a task")
+    if names_a_chore(task):
+        raise ValueError(
+            f"{task!r} describes checking the bus, which every window "
+            "does -- leave the task unset until you are given one, then "
+            "name that")
+    path = state.task_path(bus.state, bus.session)
+    temporary = f"{path}.{os.getpid()}.tmp"
+    with open(temporary, "w", encoding="utf-8") as target:
+        target.write(task)
+    os.replace(temporary, path)
+    state.republish(bus, "task", task)
+    return task
 
 
 def live_addressees(bus, to):
@@ -202,6 +249,8 @@ def routing_rows(bus):
             continue
         row["handle"] = (row.get("handle")
                          or state.default_handle(row["agent"], row["session"]))
+        row["task"] = state.task_of(bus.state, row["session"], row["agent"],
+                                    row["handle"])
         # A just-declared job is effective before the next hook heartbeat.
         row["job"] = (
             state.read_file(
@@ -256,6 +305,15 @@ def touch(bus, agent, status=None, **info):
     record["job"] = bus.job
     record["agent"] = agent
     record["handle"] = state.current_handle(bus, agent)
+    record["task"] = state.task_of(bus.state, bus.session, agent,
+                                   record["handle"])
+    if bus.parent_session:
+        record["parent"] = bus.parent_session
+        parent_handle = state.read_handle(bus.state, bus.parent_session)
+        if parent_handle:
+            record["display_handle"] = (
+                f'{record["handle"]} (helper of {parent_handle})'
+            )
     # The CLI process this row belongs to, when it can be found, so the
     # row can later be shown to be dead rather than merely quiet. Only
     # written when known: a hook can see the window above it, while a
@@ -289,6 +347,11 @@ def register(bus, agent, **info):
         str: Registered CLI name.
     """
     state.check_name(agent)
+    ensure_handle(bus, agent)
+    if agent == "codex":
+        parent_session = identity.get_parent_session(bus)
+        if parent_session:
+            bus.parent_session = parent_session
     status = info.pop("status", "idle")
     defaults = {"pid": os.getpid(), "cwd": os.getcwd()}
     defaults.update(info)
@@ -298,7 +361,7 @@ def register(bus, agent, **info):
 def _reap_orphans(bus, alive):
     """Delete per-session state belonging to no surviving presence file.
 
-    job and handle are keyed by session alone, so they outlive the
+    job, handle and task are keyed by session alone, so they outlive the
     presence row that named the agent. They are only removed once no
     presence file mentions the session at all, because a window can
     rename itself and leave a second presence file under the old name.
@@ -309,7 +372,7 @@ def _reap_orphans(bus, alive):
     """
     for name in os.listdir(bus.state):
         parts = name.split(".", 1)
-        if parts[0] not in ("job", "handle"):
+        if parts[0] not in ("job", "handle", "task"):
             continue
         if len(parts) < 2:
             continue
@@ -370,6 +433,7 @@ def roster(bus):
             "handle", state.default_handle(
                 agent, record.get(
                     "session", "")))
+        row["task"] = state.task_of(bus.state, session, agent, row["handle"])
         row["pending"] = 0
         rows.append(row)
     _reap_orphans(bus, alive)

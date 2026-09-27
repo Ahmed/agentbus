@@ -13,25 +13,19 @@ _RoutingOptions = collections.namedtuple(
     defaults=(None, None, None))
 
 
-def task_stem(handle, agent, session):
-    """Task shared by codex-data-export-001 and claude-data-export-002.
+def task_of(bus, handle, agent, session):
+    """The task a window declared, shared by its partner in another CLI.
 
     Args:
-        handle (str): Published window name.
-        agent (str): CLI name identifying this window on the bus.
-        session (str or None): Conversation identity; defaults to this window.
+        bus (Bus): Connection whose shared state holds the task files.
+        handle (str): The window's published name.
+        agent (str): CLI name identifying that window on the bus.
+        session (str or None): That window's conversation identity.
 
     Returns:
-        str or None: Task shared by handles from different CLIs.
+        str or None: The task, or None when the window has not said.
     """
-    if not handle or handle == state.default_handle(agent, session):
-        return None
-    stem = constants.NAME_NUMBER.sub("", handle)
-    if stem == agent:
-        return None
-    if stem.startswith(agent + "-"):
-        stem = stem[len(agent) + 1:]
-    return stem or None
+    return state.task_of(bus.state, session, agent, handle)
 
 
 def addressed_to(bus, agent, record):
@@ -101,7 +95,9 @@ def _route_choice(requested, rows, reason):
             (
                 f'ambiguous destination {requested!r}: {choices!s}. Use a '
                 f'unique full handle, or give the windows distinct '
-                f'jobs/names.'
+                f'jobs/names. Nothing was sent. If you cannot tell which '
+                f'of these the operator meant, ask them rather than '
+                f'picking one.'
             ))
     row = rows[0]
     return {"to": row["handle"], "to_session": row["session"],
@@ -235,9 +231,9 @@ def resolve_recipient(bus, sender, to, *args, **kwargs):
                 else {"to": to, "routing": "handle"})
     candidates = [row for row in rows
                   if row["agent"] == to and row["session"] != bus.session]
-    task = task_stem(state.current_handle(bus, sender), sender, bus.session)
-    matches = [row for row in candidates if task and task_stem(
-        row["handle"], to, row["session"]) == task]
+    task = task_of(bus, state.current_handle(bus, sender), sender,
+                   bus.session)
+    matches = [row for row in candidates if task and row["task"] == task]
     if matches:
         same_job = [row for row in matches if row.get("job") == bus.job]
         return _route_choice(to, same_job or matches, "task")
@@ -248,6 +244,8 @@ def resolve_recipient(bus, sender, to, *args, **kwargs):
                         for row in candidates) or "none registered"
     raise ValueError(
         f"no related {to} window for {state.current_handle(bus, sender)} "
-        f"(job={bus.job}). Available: {choices}. "
+        f"(job={bus.job}). Available: {choices}. Nothing was sent. "
         "Use a full handle or matching "
-        "task names/jobs; use broadcast explicitly to reach every window.")
+        "task names/jobs; use broadcast explicitly to reach every window. "
+        "If none of these is obviously the one the operator meant, ask "
+        "them which rather than guessing or broadcasting.")

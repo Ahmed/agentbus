@@ -34,7 +34,7 @@ class RoutingFixture(unittest.TestCase):
         Args:
             session (str): Stable identity for the simulated window.
             agent (str): CLI owning the simulated window.
-            handle (str or None): Optional published task handle.
+            handle (str or None): Optional task to declare.
             job (str): Declared work used by related-window routing.
         """
         client = bus.connect(self.directory, session=session,
@@ -42,7 +42,7 @@ class RoutingFixture(unittest.TestCase):
         bus.set_job(client, job)
         bus.register(client, agent)
         if handle is not None:
-            bus.set_name(client, handle)
+            bus.set_task(client, handle)
         return client
 
     def age(self, client, agent, seconds):
@@ -113,6 +113,22 @@ class TestRelatedRouting(RoutingFixture):
         self.assertEqual(record["requested_to"], "claude")
         self.assertEqual(self.ids(unrelated, "claude"), [])
         self.assertEqual(self.ids(target, "claude"), [record["id"]])
+
+    def test_a_window_named_the_old_way_still_matches_by_task(self):
+        """Verify a numbered name from before generation keeps its task."""
+        target = test_utils.holding(self.directory, "legacy", "claude",
+                                    "claude-routing-004", "other")
+        record = self.send(return_record=True)
+        self.assertEqual(record["to_session"], target.session)
+        self.assertEqual(record["routing"], "task")
+
+    def test_the_roster_shows_each_window_task_beside_its_name(self):
+        """Verify the roster reads the task, not the name, for the work."""
+        self.window("related", "claude", "sso-login", "other")
+        rows = {row["session"]: row for row in bus.agents(self.sender)}
+        self.assertEqual(rows["related"]["task"], "sso-login")
+        self.assertEqual(rows["sender"]["task"], "routing")
+        self.assertNotIn("sso", rows["related"]["handle"])
 
     def test_exact_job_breaks_tie_between_matching_tasks(self):
         """Verify exact job breaks tie between matching tasks."""
@@ -195,15 +211,18 @@ class TestDirectRouting(RoutingFixture):
     def test_absent_explicit_handle_waits_for_its_window(self):
         """Verify absent explicit handle waits for its window."""
         message_id = self.send("claude-later-001")
-        target = self.window("later", "claude", "claude-later-001", "other")
+        target = test_utils.holding(self.directory, "later", "claude",
+                                    "claude-later-001", "other")
         self.assertEqual(self.ids(target, "claude"), [message_id])
 
     def test_duplicate_explicit_handle_is_ambiguous_even_when_one_is_idle(
             self):
         """Verify idle duplicate handles still make delivery ambiguous."""
-        older = self.window("older", "claude", "claude-shared-001")
+        older = test_utils.holding(self.directory, "older", "claude",
+                                   "claude-shared-001", "routing")
         self.age(older, "claude", bus.PRESENCE_TTL_SECONDS + 10)
-        self.window("newer", "claude", "claude-shared-001")
+        test_utils.holding(self.directory, "newer", "claude",
+                           "claude-shared-001", "routing")
         self.assert_rejected_without_append("claude-shared-001")
 
     def test_reply_returns_to_original_sender_after_rename_and_job_change(
@@ -219,7 +238,7 @@ class TestDirectRouting(RoutingFixture):
             requester, "claude", bus.current_handle(
                 self.sender, "codex"), "question")
         self.assertEqual(self.ids(self.sender, "codex"), [original])
-        bus.set_name(requester, "claude-new-task")
+        bus.set_task(requester, "claude-new-task")
         bus.set_job(requester, "new-job")
         bus.touch(requester, "claude")
         reply = self.send(reply_to=original)
@@ -263,7 +282,8 @@ class TestDirectRouting(RoutingFixture):
         sender = bus.connect(self.directory, session="unregistered",
                              cwd=os.path.join(self.directory, "unregistered"))
         bus.set_job(sender, "unregistered-job")
-        published = bus.set_name(sender, "codex-unregistered")
+        bus.set_task(sender, "codex-unregistered")
+        published = bus.current_handle(sender, "codex")
         # A new process has no cached Bus.handle; it relies on the file.
         sender = bus.connect(
             self.directory,
@@ -309,7 +329,7 @@ class TestDirectRouting(RoutingFixture):
         original = self.window("original", "claude", "claude-original-001")
         old_handle = bus.current_handle(original, "claude")
         message_id = self.send(old_handle)
-        bus.set_name(original, "claude-renamed")
+        bus.set_task(original, "claude-renamed")
         replacement = self.window("replacement", "claude", old_handle)
         self.assertEqual(self.ids(replacement, "claude"), [])
         self.assertEqual(self.ids(original, "claude"), [message_id])
