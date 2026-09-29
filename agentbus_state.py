@@ -123,8 +123,9 @@ def task_of(state, session, agent, handle):
 
     A window named before names were generated carried its task inside
     the name -- codex-sso-001 -- and keeps that name until it closes, so
-    such a name still counts as saying the task. A generated name never
-    ends in a number, so it is never mistaken for one.
+    such a name still counts as saying the task. A generated name
+    (claude-417) is the CLI and a number with nothing between them, so it
+    never reads as one.
 
     Args:
         state (str): Directory containing per-window state files.

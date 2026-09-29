@@ -34,7 +34,7 @@ reach you through /tmp/agentbus/bus.jsonl, one JSON message per line.
   wait on, or restart a background mail command. Stay silent when no mail
   arrives. The listener also delivers mail already waiting at startup.
 
-  The bus gives this window its own name, such as $1-heron: no other
+  The bus gives this window its own name, such as $1-417: no other
   window holds it, and it never changes. Once you are given a task, put
   it beside the name, so the roster says who is doing what and another
   agent can reach you rather than any $1 window. Reading this mail is
@@ -53,7 +53,7 @@ reach you through /tmp/agentbus/bus.jsonl, one JSON message per line.
   candidates without sending. A full handle selects that window directly,
   even across jobs:
 
-  \$BUS send $1 codex-heron "text for that window"
+  \$BUS send $1 codex-802 "text for that window"
 
   Resolved mail stays with that session if it changes task. For an absent
   exact handle, only the project-check question queues; details stay held

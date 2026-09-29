@@ -4,18 +4,18 @@ import fcntl
 import itertools
 import json
 import os
+import random
 import re
 import socket
 import time
-import zlib
 
 import agentbus_constants as constants
 import agentbus_identity as identity
 import agentbus_state as state
 
 
-def _held_words(bus):
-    """Words already standing for some other window.
+def _held_numbers(bus):
+    """Numbers already standing for some other window.
 
     A name stays held while its window is on the roster at all, online or
     not, and for a window that has registered but not yet written a
@@ -26,7 +26,7 @@ def _held_words(bus):
         bus (Bus): Bus from connect().
 
     Returns:
-        set[str]: The word part of every other window's handle.
+        set[str]: The part after the CLI in every other window's handle.
     """
     held = set()
     handles = [row["handle"] for row in routing_rows(bus)
@@ -40,29 +40,27 @@ def _held_words(bus):
     return held
 
 
-def _pick_word(bus):
-    """The first free word, starting from one this session hashes to.
+def _pick_number(bus):
+    """A random number no other window holds.
 
-    Starting from the session rather than the top of the list keeps two
-    windows opened at once from racing for the same first word, and a
-    lock makes sure that when they do, only one of them wins it.
+    The caller holds the names lock, so two windows opening at once cannot
+    both take the one number that was free.
 
     Args:
         bus (Bus): Bus from connect().
 
     Returns:
-        str: A word no other window holds, with a digit on the end only
-            once every plain word is taken.
+        str: NAME_DIGITS digits, with one more only once every number of
+            that length is taken.
     """
-    words = constants.NAME_WORDS
-    start = zlib.crc32(bus.session.encode()) % len(words)
-    held = _held_words(bus)
-    for suffix in itertools.chain([""], (str(n) for n in itertools.count(2))):
-        for offset in range(len(words)):
-            word = words[(start + offset) % len(words)] + suffix
-            if word not in held:
-                return word
-    raise AssertionError("unreachable: the suffixes never run out")
+    held = _held_numbers(bus)
+    for digits in itertools.count(constants.NAME_DIGITS):
+        free = [str(number)
+                for number in range(10 ** (digits - 1), 10 ** digits)
+                if str(number) not in held]
+        if free:
+            return random.choice(free)
+    raise AssertionError("unreachable: the digits never run out")
 
 
 def ensure_handle(bus, agent):
@@ -84,7 +82,7 @@ def ensure_handle(bus, agent):
         existing = state.read_handle(bus.state, bus.session)
         if existing:
             return existing
-        handle = f"{agent}-{_pick_word(bus)}"
+        handle = f"{agent}-{_pick_number(bus)}"
         path = state.handle_path(bus.state, bus.session)
         temporary = f"{path}.{os.getpid()}.tmp"
         with open(temporary, "w", encoding="utf-8") as target:

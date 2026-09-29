@@ -158,8 +158,8 @@ async def list_agents() -> str:
 async def set_name(task: str) -> str:
     """Say what task this window is on, shown beside its name.
 
-    The window's name is given by the bus when it starts -- claude-otter,
-    codex-heron -- and never changes, so every window on the roster is
+    The window's name is given by the bus when it starts -- claude-417,
+    codex-802 -- and never changes, so every window on the roster is
     told apart by it. The task is what you set here, and it is what
     related-window routing matches: a claude window on "sso-login"
     sending to "codex" reaches the codex window on "sso-login".

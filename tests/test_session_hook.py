@@ -245,13 +245,13 @@ class TestWakeupMessage(unittest.TestCase):
         """Verify a woken agent is told how to reply on the bus."""
         agent_name = "claude"
         messages = [
-            {"kind": "message", "from_handle": "codex-heron", "text": "hello"}
+            {"kind": "message", "from_handle": "codex-802", "text": "hello"}
         ]
 
         preamble = session_hook._preamble(agent_name, messages, woken=True)
 
         self.assertIn("python3", preamble)
-        self.assertIn(f"bus.py send {agent_name} codex-heron", preamble)
+        self.assertIn(f"bus.py send {agent_name} codex-802", preamble)
         self.assertIn("report_result tool with the task's id", preamble)
         self.assertIn("Before you stop, tell the operator", preamble)
 

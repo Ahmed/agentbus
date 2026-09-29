@@ -19,7 +19,7 @@ command. A persistent listener delivers waiting and newly arriving mail.
 Stay silent when no mail arrives.
 
 **Say what task you are on, once you are given one.** The bus gives this
-window its own name, such as `NAME-heron`: no other window holds it, and it
+window its own name, such as `NAME-417`: no other window holds it, and it
 never changes. The task goes beside it, so the roster says who is doing
 what and another agent can reach you rather than any window of your CLI.
 Reading this mail is not a task, and is refused as one:
@@ -38,7 +38,7 @@ The send prints the chosen handle; if no unique related window exists, it
 fails with candidates and sends nothing. Use a full handle to choose a
 window directly, even across jobs:
 
-    $BUS send NAME codex-heron "text for that window"
+    $BUS send NAME codex-802 "text for that window"
 
 Resolved mail stays with the chosen session even if it changes task. For an
 absent exact handle, only a project-check question queues; content remains
