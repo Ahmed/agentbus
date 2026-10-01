@@ -477,7 +477,9 @@ class ProjectConfirmationContextTests(ConfirmationFixture):
                     client=legacy)["status"],
                 "confirmed")
         with fixtures.process_generation("2000"):
-            replacement = self.window("claude200", "claude", handle)
+            replacement = fixtures.holding(self.directory, "claude200",
+                                           "claude", handle,
+                                           self.DEFAULT_JOB)
             self.assertEqual(self.messages(replacement, "claude"), [])
             with self.assertRaises(ValueError):
                 self.confirm(unanswered, client=replacement)

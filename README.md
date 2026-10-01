@@ -119,30 +119,30 @@ and uses the same confirmation for each recipient.
 ### A window has a name; it says what task it is on
 
 Every window is given a name by the bus the first time it registers:
-its CLI and a word, `claude-otter`, `codex-heron`. No two windows on the
-bus hold the same word, whatever their CLI, and a window keeps its name
+its CLI and a random three-digit number, `claude-417`, `codex-802`. No
+two windows on the bus hold the same number, whatever their CLI, and a window keeps its name
 for life. The model never chooses it, so it is never a copy of somebody
-else's, never the name of the chore the window was doing when it was
-asked, and never a number that is the only difference between two rows.
+else's, and never the name of the chore the window was doing when it was
+asked.
 
 What the window is working on is a separate label, its **task**, which
 the window declares once it has been given one:
 
 ```
 set_name("sso-login")          # the MCP tool
-bmail name sso-login           # from a shell -> claude-otter task=sso-login
+bmail name sso-login           # from a shell -> claude-417 task=sso-login
 ```
 
 The roster shows both:
 
 ```
-claude-otter    claude  online   task=sso-login        job=webapp@main
-codex-heron     codex   online   task=sso-login        job=webapp@main
-claude-wren     claude  online   task=-                job=agentbus@main
+claude-417  claude  online   task=sso-login        job=webapp@main
+codex-802   codex   online   task=sso-login        job=webapp@main
+claude-356  claude  online   task=-                job=agentbus@main
 ```
 
 A Codex sub-agent (helper) will have its relationship to its parent
-reflected in its handle, e.g., `codex-glacier (helper of codex-maple)`.
+reflected in its handle, e.g., `codex-639 (helper of codex-218)`.
 The helper inherits the confirmed project pairings of its parent, so it
 does not need to re-confirm projects that the parent has already
 confirmed.
@@ -164,14 +164,14 @@ Use the name on the **receiving** side of `send` when the message belongs
 to one window:
 
 ```
-bmail send codex claude-otter "Update for that Claude window"
-bmail send claude codex-heron "Reply for that Codex window"
+bmail send codex claude-417 "Update for that Claude window"
+bmail send claude codex-802 "Reply for that Codex window"
 ```
 
 For ordinary communication, a bare CLI name finds the related window:
 
 ```
-bmail name data-export                           # -> codex-heron task=data-export
+bmail name data-export                           # -> codex-802 task=data-export
 bmail send codex claude "Update on data-export"  # -> the claude on data-export
 ```
 
@@ -527,12 +527,11 @@ tell apart:
   "CLI", and the roster listed it twice.
 
 So a name now says only *which* window, and the bus picks it: the CLI
-and a word from a fixed list, unique across every window on the roster
+and a random three-digit number, unique across every window on the roster
 whatever its CLI, and never reused while its window is still listed, even
-offline. Two windows opening at the same moment start from words their
-session ids hash to and take a lock, so they never pick the same one. If
-every word is taken, the next window gets a digit on the end
-(`claude-otter2`) rather than a shared name.
+offline. Picking takes a lock, so two windows opening at the same moment
+never draw the same number. If every three-digit number is taken, the next
+window gets four digits (`claude-4172`) rather than a shared name.
 
 *What* a window is doing is its task, set with `bmail name <task>` or
 `set_name`, and shown beside the name. A task made only of words for
@@ -586,10 +585,10 @@ never delivered looks exactly like one that was.
 Now it waits briefly and says:
 
 ```
-codex-heron -> claude-otter (awaiting_confirmation)
-claude-otter: confirmed, message delivered
-claude-otter: declined the project, nothing was shared
-claude-otter: no answer yet, nothing shared so far
+codex-802 -> claude-417 (awaiting_confirmation)
+claude-417: confirmed, message delivered
+claude-417: declined the project, nothing was shared
+claude-417: no answer yet, nothing shared so far
 ```
 
 Bounded on purpose — a courtesy at the end of a send, not a reason for the

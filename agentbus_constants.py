@@ -65,30 +65,12 @@ NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 NAME_NUMBER = re.compile(r"-[0-9]{3}$")
 
 # What a window is called, as opposed to what it is doing. Every window is
-# given one of these when it first registers -- claude-otter, codex-heron
-# -- and keeps it for life. It is never chosen by the model and never
-# shared: no two windows on the bus hold the same word, whatever their
-# CLI, so the roster never shows two rows a reader has to tell apart by a
-# number. The task a window is on is a separate label beside it.
-#
-# Short, unlike each other, and unlike anything a task would be called.
-NAME_WORDS = (
-    "acacia", "agate", "alder", "amber", "aspen", "badger", "baobab",
-    "basalt", "beaver", "beryl", "birch", "bison", "bobcat", "brook",
-    "camel", "canyon", "cedar", "coyote", "crane", "cypress", "dove",
-    "dune", "egret", "elk", "ferret", "finch", "fir", "fjord", "fox",
-    "garnet", "gazelle", "gecko", "geyser", "glacier", "granite", "grove",
-    "hare", "hawk", "hazel", "hemlock", "heron", "ibex", "ibis", "jaguar",
-    "jay", "juniper", "koala", "lagoon", "larch", "lark", "laurel",
-    "lemur", "linden", "lynx", "magpie", "maple", "marble", "marsh",
-    "marten", "meadow", "meerkat", "mesa", "mica", "mink", "moose",
-    "narwhal", "newt", "oak", "ocelot", "okapi", "onyx", "orca", "osprey",
-    "otter", "owl", "plover", "poplar", "possum", "prairie", "puffin",
-    "puma", "quartz", "raccoon", "reef", "ridge", "robin", "rowan",
-    "seal", "sequoia", "shrew", "spruce", "stoat", "stork", "tapir",
-    "tern", "toad", "topaz", "tundra", "valley", "vole", "walrus",
-    "willow", "wolf", "wombat", "wren", "yak", "yew", "zebra",
-)
+# given its CLI and a random number of this many digits when it first
+# registers -- claude-417, codex-802 -- and keeps it for life. It is never
+# chosen by the model and never shared: no two windows on the bus hold the
+# same number, whatever their CLI, and the leading digit is never 0. The
+# task a window is on is a separate label beside it.
+NAME_DIGITS = 3
 
 # Words for reading the bus rather than for any piece of work. A new
 # window is told to check its mail before it has been given anything else

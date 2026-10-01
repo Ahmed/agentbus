@@ -330,7 +330,8 @@ class TestDirectRouting(RoutingFixture):
         old_handle = bus.current_handle(original, "claude")
         message_id = self.send(old_handle)
         bus.set_task(original, "claude-renamed")
-        replacement = self.window("replacement", "claude", old_handle)
+        replacement = test_utils.holding(self.directory, "replacement",
+                                         "claude", old_handle, "routing")
         self.assertEqual(self.ids(replacement, "claude"), [])
         self.assertEqual(self.ids(original, "claude"), [message_id])
 

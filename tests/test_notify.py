@@ -265,37 +265,52 @@ class WindowNameTests(fixtures.BusFixture):
         bus.register(window, agent)
         return window
 
-    def test_registering_gives_a_word_name(self):
-        """A new window is claude-<word>, not a hex fragment or a number."""
+    def test_registering_gives_a_number_name(self):
+        """A new window is claude-<three digits>, not a word or hex."""
         window = self.fresh("fresh-session")
 
         handle = bus.current_handle(window, "claude")
 
-        self.assertTrue(handle.startswith("claude-"))
-        self.assertIn(handle.split("-", 1)[1], bus.constants.NAME_WORDS)
+        self.assertRegex(handle, r"^claude-[1-9][0-9]{2}$")
         self.assertIsNone(bus.current_task(window, "claude"))
 
-    def test_no_two_windows_share_a_word_whatever_their_cli(self):
-        """claude-otter and codex-otter would be two rows to tell apart."""
-        words = set()
+    def test_no_two_windows_share_a_number_whatever_their_cli(self):
+        """claude-417 and codex-417 would be two rows to tell apart."""
+        numbers = set()
         for number in range(30):
             agent = ("claude", "codex")[number % 2]
             window = self.fresh(f"window-{number}", agent)
-            words.add(bus.current_handle(window, agent).split("-", 1)[1])
+            numbers.add(bus.current_handle(window, agent).split("-", 1)[1])
 
-        self.assertEqual(len(words), 30)
+        self.assertEqual(len(numbers), 30)
 
-    def test_every_word_taken_falls_back_to_a_digit(self):
-        """Running out of words is not a reason to share one."""
+    def hold(self, numbers):
+        """Put windows on the bus that already hold these numbers.
+
+        Args:
+            numbers (iterable[int]): Numbers to mark as taken.
+        """
         state = bus.connect(self.directory, session="observer").state
-        for number, word in enumerate(bus.constants.NAME_WORDS):
+        for number in numbers:
             path = os.path.join(state, f"handle.taken-{number}")
             with open(path, "w", encoding="utf-8") as handle:
-                handle.write(f"codex-{word}")
+                handle.write(f"codex-{number}")
+
+    def test_a_held_number_is_never_handed_out(self):
+        """The one number left free is the one a new window gets."""
+        self.hold(number for number in range(100, 1000) if number != 555)
 
         handle = bus.current_handle(self.fresh("late-window"), "claude")
 
-        self.assertRegex(handle, r"^claude-[a-z]+2$")
+        self.assertEqual(handle, "claude-555")
+
+    def test_every_number_taken_falls_back_to_four_digits(self):
+        """Running out of numbers is not a reason to share one."""
+        self.hold(range(100, 1000))
+
+        handle = bus.current_handle(self.fresh("late-window"), "claude")
+
+        self.assertRegex(handle, r"^claude-[1-9][0-9]{3}$")
 
     def test_the_name_is_kept_for_life(self):
         """Declaring or changing the task never renames the window."""

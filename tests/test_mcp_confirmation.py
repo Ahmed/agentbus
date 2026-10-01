@@ -198,7 +198,8 @@ class MCPConfirmationTests(fixtures.BusFixture,
         await self.accept_task(task_id)
         original_handle = bus.current_handle(self.requester, "codex")
         bus.set_task(self.requester, "codex-mcp-followup")
-        replacement = self.window("replacement", "codex", original_handle)
+        replacement = fixtures.holding(self.directory, "replacement", "codex",
+                                       original_handle, self.DEFAULT_JOB)
         result_text = "Held result: details belong to the original requester."
         response = await self.call(
             self.assignee, "claude", server.report_result,
@@ -246,7 +247,8 @@ class MCPConfirmationTests(fixtures.BusFixture,
         task = bus.get_task(self.requester, task_id)
         original_handle = bus.current_handle(self.requester, "codex")
         bus.set_task(self.requester, "codex-after-compaction")
-        replacement = self.window("replacement", "codex", original_handle)
+        replacement = fixtures.holding(self.directory, "replacement", "codex",
+                                       original_handle, self.DEFAULT_JOB)
         self.compacted_message_id = task["message_id"]
 
         response = await self.call(
